@@ -56,11 +56,11 @@
 extern crate alloc;
 
 use alloc::{collections::BTreeMap, format, string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use aster_block::{
     BlockDevice, BlockDeviceMeta, MajorIdOwner, allocate_major_with_name,
-    bio::{BioEnqueueError, SubmittedBio},
+    bio::{BioEnqueueError, BioType, SubmittedBio},
 };
 use component::{ComponentInitError, init_component};
 use device_id::{DeviceId, MajorId, MinorId};
@@ -283,7 +283,6 @@ pub struct MappedDevice {
     /// on resume. Implements Linux's table hot-replacement:
     /// suspend → load new table → resume swaps.
     inactive_table: spin::Mutex<Option<Arc<DmTable>>>,
-    suspended: AtomicBool,
     /// Read-only flag set at device creation or table load time when
     /// `DM_READONLY_FLAG` is supplied by userspace.
     readonly: AtomicBool,
@@ -300,40 +299,107 @@ pub struct MappedDevice {
     open_count: AtomicU32,
 }
 
-/// Tracks in-flight I/O requests so that `suspend` can wait for all
-/// outstanding bios to complete before switching tables.
+/// Tracks in-flight I/O requests and the suspended state so that `suspend`
+/// can wait for all outstanding bios to complete before switching tables.
+///
+/// The suspended flag and the in-flight count are packed into a single
+/// `AtomicU32` so that [`submit`](Self::submit) can perform the
+/// "admit only if not suspended" check together with the in-flight
+/// increment as one atomic CAS. This closes the TOCTOU window where a bio
+/// could pass a separate suspended check but not yet be counted when
+/// [`drain`](Self::drain) runs, which would let I/O reach a table that has
+/// already been swapped out.
 struct DmIoState {
-    in_flight: AtomicUsize,
+    /// Bit 31: suspended flag. Bits 0..=30: in-flight bio count.
+    state: AtomicU32,
     drained: WaitQueue,
 }
+
+/// Mask for the suspended flag (bit 31) in [`DmIoState::state`].
+const SUSPENDED_BIT: u32 = 1 << 31;
+/// Mask for the in-flight count (bits 0..=30) in [`DmIoState::state`].
+const IN_FLIGHT_MASK: u32 = !SUSPENDED_BIT;
 
 impl DmIoState {
     fn new() -> Self {
         Self {
-            in_flight: AtomicUsize::new(0),
+            state: AtomicU32::new(0),
             drained: WaitQueue::new(),
         }
     }
 
-    /// Called when a bio is submitted to the backing device.
-    fn submit(&self) {
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
+    /// Atomically admits a bio: increments the in-flight count only if the
+    /// device is not suspended.
+    ///
+    /// Returns [`BioEnqueueError::Refused`] if the device is suspended, so
+    /// the caller must not forward the bio. On success the bio is counted
+    /// as in-flight and a matching [`finish`](Self::finish) is required.
+    fn submit(&self) -> Result<(), BioEnqueueError> {
+        loop {
+            let cur = self.state.load(Ordering::Acquire);
+            if cur & SUSPENDED_BIT != 0 {
+                return Err(BioEnqueueError::Refused);
+            }
+            let new = cur.wrapping_add(1);
+            // The in-flight count must never overflow into the suspended bit.
+            if new & SUSPENDED_BIT != 0 {
+                return Err(BioEnqueueError::Refused);
+            }
+            if self
+                .state
+                .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
     }
 
     /// Called when a bio completes (success or error). Wakes the drain
     /// waiter when the last in-flight bio finishes.
     fn finish(&self) {
-        let prev = self.in_flight.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(prev > 0);
-        if prev == 1 {
+        let prev = self.state.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(
+            prev & IN_FLIGHT_MASK > 0,
+            "finish called with no in-flight bio"
+        );
+        if (prev & IN_FLIGHT_MASK) == 1 {
             self.drained.wake_all();
         }
     }
 
     /// Blocks until no in-flight I/O remains.
+    ///
+    /// The caller must have marked the device suspended first (via
+    /// [`mark_suspended`](Self::mark_suspended)) so that no new bios are
+    /// admitted while draining.
     fn drain(&self) {
-        self.drained
-            .wait_until(|| (self.in_flight.load(Ordering::Acquire) == 0).then_some(()));
+        self.drained.wait_until(|| {
+            (self.state.load(Ordering::Acquire) & IN_FLIGHT_MASK == 0).then_some(())
+        });
+    }
+
+    /// Sets the suspended flag atomically. After this call, `submit` will
+    /// refuse all new bios.
+    fn mark_suspended(&self) {
+        self.state.fetch_or(SUSPENDED_BIT, Ordering::AcqRel);
+    }
+
+    /// Clears the suspended flag atomically, allowing new bios to be
+    /// admitted again.
+    fn clear_suspended(&self) {
+        self.state.fetch_and(IN_FLIGHT_MASK, Ordering::AcqRel);
+    }
+
+    /// Returns whether the suspended flag is set.
+    fn is_suspended(&self) -> bool {
+        self.state.load(Ordering::Acquire) & SUSPENDED_BIT != 0
+    }
+
+    /// Returns the number of bios currently in flight.
+    #[cfg(ktest)]
+    fn in_flight(&self) -> usize {
+        (self.state.load(Ordering::Acquire) & IN_FLIGHT_MASK) as usize
     }
 }
 
@@ -396,7 +462,7 @@ impl MappedDevice {
             // Linux creates DM devices in the suspended state, but we don't:
             // libdevmapper may skip the resume ioctl when its internal
             // suspended-device counter is zero, which would strand I/O.
-            suspended: AtomicBool::new(false),
+            // The suspended flag lives in DmIoState (cleared at construction).
             readonly: AtomicBool::new(false),
             io: Arc::new(DmIoState::new()),
             event_nr: AtomicU32::new(0),
@@ -470,10 +536,11 @@ impl MappedDevice {
 
     fn set_suspended_with_flush(&self, suspended: bool, flush: bool) {
         if suspended {
-            // Suspend: set the flag first to block new I/O, then wait for
-            // all in-flight bios to complete before returning unless the
-            // caller requested a no-flush suspend.
-            self.suspended.store(true, Ordering::Release);
+            // Suspend: mark suspended first so that no new bios are admitted
+            // (submit() atomically refuses them), then wait for all in-flight
+            // bios to complete before returning unless the caller requested a
+            // no-flush suspend.
+            self.io.mark_suspended();
             if flush {
                 self.io.drain();
             }
@@ -487,14 +554,16 @@ impl MappedDevice {
             if let Some(new_table) = inactive.take() {
                 *active = Some(new_table);
             }
-            self.suspended.store(false, Ordering::Release);
+            // Clear suspended only after the table swap so that bios admitted
+            // after resume see the new (active) table, not the old one.
+            self.io.clear_suspended();
             self.bump_event_nr();
         }
     }
 
     /// Returns whether the device is currently suspended.
     pub fn is_suspended(&self) -> bool {
-        self.suspended.load(Ordering::Acquire)
+        self.io.is_suspended()
     }
 
     /// Returns the current event number.
@@ -526,7 +595,7 @@ impl MappedDevice {
     pub fn reset(&self) {
         *self.table.lock() = None;
         *self.inactive_table.lock() = None;
-        self.suspended.store(false, Ordering::Release);
+        self.io.clear_suspended();
     }
 
     /// Returns the device name.
@@ -556,7 +625,7 @@ impl MappedDevice {
     /// Returns the number of bios currently in flight.
     #[cfg(ktest)]
     pub(crate) fn in_flight(&self) -> usize {
-        self.io.in_flight.load(Ordering::Acquire)
+        self.io.in_flight()
     }
 
     /// Renames the device, updating its in-memory name field.
@@ -677,13 +746,28 @@ impl MappedDevice {
 
 impl BlockDevice for MappedDevice {
     fn enqueue(&self, mut bio: SubmittedBio) -> Result<(), BioEnqueueError> {
-        if self.is_suspended() {
+        // P0-2: Enforce the read-only flag. Reads and flushes are allowed;
+        // writes are refused. Flush is permitted because a read-only device
+        // may still need to flush already-persisted data, and filesystems
+        // issue flush regardless of the device's writability.
+        if self.is_readonly() && bio.type_() == BioType::Write {
             return Err(BioEnqueueError::Refused);
         }
+
+        // P0-1: Atomically admit the bio. submit() checks the suspended flag
+        // and increments the in-flight count in a single CAS, so a bio that
+        // passes this point is guaranteed to be counted by a concurrent
+        // suspend's drain(). This closes the TOCTOU window where a bio could
+        // observe "not suspended" but not yet be in-flight when drain runs.
+        self.io.submit()?;
+
+        // Clone the table only after admission. Because the in-flight count
+        // was incremented atomically with the suspended check, any suspend
+        // that starts now will drain() and wait for this bio to finish
+        // before swapping the table.
         let table = self.table.lock().clone();
         match table {
             Some(table) => {
-                self.io.submit();
                 let io = self.io.clone();
                 bio.chain_complete_fn(move |_status| {
                     io.finish();
@@ -696,7 +780,10 @@ impl BlockDevice for MappedDevice {
                     }
                 }
             }
-            None => Err(BioEnqueueError::Refused),
+            None => {
+                self.io.finish();
+                Err(BioEnqueueError::Refused)
+            }
         }
     }
 
@@ -730,7 +817,7 @@ impl core::fmt::Debug for MappedDevice {
         f.debug_struct("MappedDevice")
             .field("id", &self.id)
             .field("name", &self.name)
-            .field("suspended", &self.suspended.load(Ordering::Relaxed))
+            .field("suspended", &self.io.is_suspended())
             .finish_non_exhaustive()
     }
 }
