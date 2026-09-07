@@ -80,10 +80,7 @@
         description = "The log level of Asterinas NixOS.";
       };
       console = lib.mkOption {
-        type = lib.types.enum [
-          "tty0"
-          "hvc0"
-        ];
+        type = lib.types.enum [ "tty0" "ttyS0" "hvc0" ];
         default = "@aster-console@";
         description = "The console device.";
       };

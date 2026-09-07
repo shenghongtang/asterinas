@@ -2,7 +2,7 @@
 
 use align_ext::AlignExt;
 use io_util::batch::IoBatch;
-use ostd::mm::{VmIo, VmReader, VmWriter};
+use ostd::mm::{VmIo, VmIoFill, VmReader, VmWriter};
 
 use super::{
     BLOCK_SIZE, BlockDevice, SECTOR_SIZE,
@@ -130,6 +130,15 @@ impl VmIo for dyn BlockDevice {
                 let segment_offset = offset - aligned_offset;
                 bio_segment.read(segment_offset, writer)?;
 
+                Ok(())
+            }
+            // The target reported that the read region contains only zeros
+            // (e.g., the DM `zero` target). Fill the caller's buffer with
+            // zeros directly, skipping the DMA segment.
+            BioStatus::Zeros => {
+                writer
+                    .fill_zeros(read_len)
+                    .map_err(|_| ostd::Error::IoError)?;
                 Ok(())
             }
             _ => Err(ostd::Error::IoError),
@@ -268,11 +277,19 @@ impl dyn BlockDevice {
             vec![write_segment.clone()],
             None,
         );
-        if read_bio.submit_and_wait(self)? != BioStatus::Complete {
-            return Err(ostd::Error::IoError);
+        match read_bio.submit_and_wait(self)? {
+            BioStatus::Complete => Ok(write_segment),
+            // The target reported zeros (e.g., DM zero target). Fill the
+            // segment with zeros so the subsequent write-back preserves them.
+            BioStatus::Zeros => {
+                write_segment
+                    .inner_dma_slice()
+                    .fill_zeros(0, write_segment.nbytes())
+                    .map_err(|_| ostd::Error::IoError)?;
+                Ok(write_segment)
+            }
+            _ => Err(ostd::Error::IoError),
         }
-
-        Ok(write_segment)
     }
 }
 
@@ -291,7 +308,7 @@ pub(super) fn general_complete_fn(
     bio_status: BioStatus,
     complete_fn: Option<BioCompleteFn>,
 ) {
-    if bio_status != BioStatus::Complete {
+    if bio_status != BioStatus::Complete && bio_status != BioStatus::Zeros {
         ostd::error!(
             "failed to do {:?} on the device with error status: {:?}",
             bio_type,

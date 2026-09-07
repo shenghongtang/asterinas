@@ -8,6 +8,19 @@ use super::{
 };
 use crate::prelude::*;
 
+/// Applies a signed sector offset to a `Sid`, returning the adjusted `Sid`.
+///
+/// A positive offset adds sectors; a negative offset subtracts sectors.
+/// This is used by `BioRequest` to compute the physical sector range from a
+/// `SubmittedBio`'s logical range and its (possibly negative) `sid_offset`.
+fn apply_sid_offset(sid: Sid, offset: i64) -> Sid {
+    if offset >= 0 {
+        sid + offset as u64
+    } else {
+        sid - (-offset) as u64
+    }
+}
+
 /// A simple block I/O request queue backed by one internal FIFO queue.
 ///
 /// It is a FIFO producer-consumer queue, where the producer (e.g., filesystem)
@@ -195,8 +208,8 @@ impl BioRequest {
 
         let sid_offset = rq_bio.sid_offset();
 
-        rq_bio.sid_range().start + sid_offset == self.sid_range.end
-            || rq_bio.sid_range().end + sid_offset == self.sid_range.start
+        apply_sid_offset(rq_bio.sid_range().start, sid_offset) == self.sid_range.end
+            || apply_sid_offset(rq_bio.sid_range().end, sid_offset) == self.sid_range.start
     }
 
     /// Merges the `SubmittedBio` into this request.
@@ -212,11 +225,11 @@ impl BioRequest {
         let rq_bio_nr_segments = rq_bio.segments().len();
         let sid_offset = rq_bio.sid_offset();
 
-        if rq_bio.sid_range().start + sid_offset == self.sid_range.end {
-            self.sid_range.end = rq_bio.sid_range().end + sid_offset;
+        if apply_sid_offset(rq_bio.sid_range().start, sid_offset) == self.sid_range.end {
+            self.sid_range.end = apply_sid_offset(rq_bio.sid_range().end, sid_offset);
             self.bios.push_back(rq_bio);
         } else {
-            self.sid_range.start = rq_bio.sid_range().start + sid_offset;
+            self.sid_range.start = apply_sid_offset(rq_bio.sid_range().start, sid_offset);
             self.bios.push_front(rq_bio);
         }
 
@@ -226,9 +239,10 @@ impl BioRequest {
 
 impl From<SubmittedBio> for BioRequest {
     fn from(bio: SubmittedBio) -> Self {
+        let sid_offset = bio.sid_offset();
         let mut sid_range = bio.sid_range().clone();
-        sid_range.start = sid_range.start + bio.sid_offset();
-        sid_range.end = sid_range.end + bio.sid_offset();
+        sid_range.start = apply_sid_offset(sid_range.start, sid_offset);
+        sid_range.end = apply_sid_offset(sid_range.end, sid_offset);
 
         Self {
             type_: bio.type_(),

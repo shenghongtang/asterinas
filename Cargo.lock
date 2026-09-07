@@ -137,6 +137,7 @@ dependencies = [
  "aster-block",
  "aster-cmdline",
  "aster-console",
+ "aster-dm",
  "aster-framebuffer",
  "aster-fuse",
  "aster-i8042",
@@ -194,6 +195,20 @@ dependencies = [
  "xarray",
  "xmas-elf",
  "zerocopy",
+]
+
+[[package]]
+name = "aster-dm"
+version = "0.1.0"
+dependencies = [
+ "aster-block",
+ "aster-cmdline",
+ "component",
+ "device-id",
+ "id-alloc",
+ "io-util",
+ "ostd",
+ "spin",
 ]
 
 [[package]]

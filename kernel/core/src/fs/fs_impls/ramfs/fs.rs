@@ -956,9 +956,11 @@ impl RamInode {
             return_errno_with_message!(Errno::ENOTDIR, "self is not dir");
         }
 
-        let self_dir = self.inner.as_direntry().unwrap().upread();
-        if self_dir.contains_entry(name) {
-            return_errno_with_message!(Errno::EEXIST, "entry exists");
+        let mut self_dir = self.inner.as_direntry().unwrap().write();
+        // Replace existing entry (e.g., libdevmapper re-creating device nodes
+        // after an ioctl). Linux devtmpfs also replaces existing nodes.
+        if let Some((idx, _)) = self_dir.get_entry(name) {
+            let _ = self_dir.remove_entry(idx);
         }
 
         let (uid, gid) = current_fs_ids();
@@ -984,7 +986,6 @@ impl RamInode {
             ),
         };
 
-        let mut self_dir = self_dir.upgrade();
         self_dir.append_entry(name, new_inode.clone());
         drop(self_dir);
 

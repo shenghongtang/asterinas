@@ -100,6 +100,18 @@ fn split_arg(input: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+/// Strips one matching pair of surrounding double quotes from a token.
+///
+/// The command-line tokenizer (`split_arg`) preserves the wrapping quotes in
+/// each token so that values containing spaces stay together. This helper
+/// removes exactly one outer pair, mirroring how Linux's `lib/cmdline.c`
+/// unquotes kernel parameter values before dispatch.
+fn strip_surrounding_quotes(s: &str) -> &str {
+    s.strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(s)
+}
+
 fn dispatch_params(cmdline: &str) -> InitprocArgs {
     let mut result: InitprocArgs = InitprocArgs {
         argv: Vec::new(),
@@ -131,6 +143,11 @@ fn dispatch_params(cmdline: &str) -> InitprocArgs {
             kcmdline_end = true;
             continue;
         }
+
+        // Strip one matching pair of surrounding double quotes, mirroring how
+        // Linux's `lib/cmdline.c` unquotes kernel parameter values. This allows
+        // `dm_mod.create="name: 0 4096 linear ..."` to be parsed correctly.
+        let arg = strip_surrounding_quotes(arg);
 
         let (key, value) = match arg.find('=') {
             Some(pos) => (&arg[..pos], Some(&arg[pos + 1..])),

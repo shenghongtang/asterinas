@@ -43,15 +43,26 @@ pub(super) fn sys_mknodat(
             .into_parent_and_filename()?
     };
 
+    // Resolve the dev number for DM block device nodes.
+    //
+    // libdevmapper calls mknod("/dev/mapper/<name>", S_IFBLK, dev) but may
+    // pass dev=0 (when udev is absent) or an old-format dev. Always try to
+    // resolve the correct dev from the DM registry by device name first.
+    let dev = if inode_type == InodeType::BlockDevice {
+        resolve_dm_dev(&name).unwrap_or(dev as u64)
+    } else {
+        dev as u64
+    };
+
     match inode_type {
         InodeType::File => {
             let _ = dir_path.new_child(&name, InodeType::File, inode_mode)?;
         }
         InodeType::CharDevice => {
-            let _ = dir_path.mknod(&name, inode_mode, MknodType::CharDevice(dev as u64))?;
+            let _ = dir_path.mknod(&name, inode_mode, MknodType::CharDevice(dev))?;
         }
         InodeType::BlockDevice => {
-            let _ = dir_path.mknod(&name, inode_mode, MknodType::BlockDevice(dev as u64))?;
+            let _ = dir_path.mknod(&name, inode_mode, MknodType::BlockDevice(dev))?;
         }
         InodeType::NamedPipe => {
             let _ = dir_path.mknod(&name, inode_mode, MknodType::NamedPipe)?;
@@ -63,6 +74,14 @@ pub(super) fn sys_mknodat(
     }
     fs::vfs::notify::on_create(&dir_path, || name);
     Ok(SyscallReturn::Return(0))
+}
+
+/// Resolves the dev_t (glibc-encoded u64) for a DM device by name.
+///
+/// Returns `None` if the name doesn't match any registered DM device.
+fn resolve_dm_dev(name: &str) -> Option<u64> {
+    let device = aster_dm::MappedDevice::lookup_by_name(name)?;
+    Some(device.device_id().as_encoded_u64())
 }
 
 pub(super) fn sys_mknod(

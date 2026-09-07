@@ -200,7 +200,14 @@ impl From<BioEnqueueError> for Error {
 /// The request queue of block device only accepts a `SubmittedBio` into the queue.
 pub struct SubmittedBio {
     metadata: Arc<BioMetadata>,
-    sid_offset: u64,
+    /// The signed offset added to the bio's logical sector range to obtain the
+    /// physical sector range on the underlying device.
+    ///
+    /// A signed offset is necessary because device mapper targets may remap a
+    /// bio to physical sectors whose start is below the logical start sector on
+    /// the mapped device (e.g., when a target maps logical sector 1000 to
+    /// physical sector 0 of the underlying device).
+    sid_offset: i64,
     complete_fn: Option<BioCompleteFn>,
     segments: Vec<BioSegment>,
 }
@@ -217,13 +224,171 @@ impl SubmittedBio {
     }
 
     /// Returns the offset of the first sector id.
-    pub fn sid_offset(&self) -> u64 {
+    pub fn sid_offset(&self) -> i64 {
         self.sid_offset
     }
 
     /// Sets the offset of the first sector id.
-    pub fn set_sid_offset(&mut self, offset: u64) {
+    ///
+    /// The offset is signed to allow device mapper targets to remap bios to
+    /// physical sectors that are below the logical start sector.
+    pub fn set_sid_offset(&mut self, offset: i64) {
         self.sid_offset = offset;
+    }
+
+    /// Returns the current (offset-adjusted) sector range seen by the
+    /// underlying block device layer.
+    ///
+    /// This is `metadata.sid_range` shifted by `sid_offset`.
+    pub fn current_sid_range(&self) -> Range<Sid> {
+        let start = apply_offset(self.metadata.sid_range.start, self.sid_offset);
+        let end = apply_offset(self.metadata.sid_range.end, self.sid_offset);
+        start..end
+    }
+
+    /// Chains an additional completion callback after the existing one.
+    ///
+    /// When the bio completes, the original `complete_fn` (if any) is invoked
+    /// first, then the chained callback is invoked. This is used by the
+    /// device-mapper to track in-flight I/O for suspend/resume draining.
+    pub fn chain_complete_fn(&mut self, f: impl FnOnce(BioStatus) + Send + 'static) {
+        let prev = self.complete_fn.take();
+        self.complete_fn = Some(Box::new(move |status| {
+            if let Some(prev) = prev {
+                prev(status);
+            }
+            f(status);
+        }));
+    }
+
+    /// Splits this bio into multiple child bios covering the given ranges.
+    ///
+    /// The `ranges` are expressed in the **current** layer's coordinate
+    /// system (i.e., after applying `sid_offset`). They must be contiguous,
+    /// non-empty, and exactly cover [`current_sid_range`](Self::current_sid_range)
+    /// without gaps or overlaps.
+    ///
+    /// Each child bio inherits the parent's `sid_offset` and receives a
+    /// sub-slice of the parent's segments. The children are created with
+    /// `BioStatus::Submit` so that they can be enqueued to underlying devices
+    /// directly.
+    ///
+    /// The returned [`SplitBioCompletionHandle`] can be used to manually
+    /// report a child's failure (e.g., when enqueue fails) via
+    /// [`SplitBioCompletionHandle::complete_child`]. When all children have
+    /// completed (either successfully or via manual reporting), the original
+    /// bio is completed with the aggregate status.
+    pub fn split(
+        self,
+        ranges: Vec<Range<Sid>>,
+    ) -> Result<(Vec<Self>, SplitBioCompletionHandle), BioEnqueueError> {
+        self.validate_split_ranges(&ranges)?;
+
+        let type_ = self.type_();
+        let parent_offset = self.sid_offset;
+        let child_segments = ranges
+            .iter()
+            .map(|range| self.segments_for_child_range(range))
+            .collect::<Result<Vec<_>, _>>()?;
+        let completion = Arc::new(SplitBioCompletion {
+            remaining: AtomicUsize::new(ranges.len()),
+            status: AtomicU32::new(BioStatus::Complete as u32),
+            original: SpinLock::new(Some(self)),
+        });
+
+        let children = ranges
+            .into_iter()
+            .zip(child_segments)
+            .map(|(range, segments)| {
+                let completion = completion.clone();
+                // Convert the current-layer range back to the original logical
+                // coordinate by subtracting the parent's sid_offset. The child
+                // inherits the parent's sid_offset so that
+                // `child.metadata.sid_range + child.sid_offset == range`.
+                let orig_start = apply_offset(range.start, -parent_offset);
+                let orig_end = apply_offset(range.end, -parent_offset);
+                Self {
+                    metadata: Arc::new(BioMetadata {
+                        type_,
+                        sid_range: orig_start..orig_end,
+                        status: AtomicU32::new(BioStatus::Submit as u32),
+                        wait_queue: WaitQueue::new(),
+                    }),
+                    sid_offset: parent_offset,
+                    complete_fn: Some(Box::new(move |status| completion.complete_child(status))),
+                    segments,
+                }
+            })
+            .collect();
+        Ok((children, SplitBioCompletionHandle { inner: completion }))
+    }
+
+    /// Validates that `ranges` exactly cover the current sector range.
+    fn validate_split_ranges(&self, ranges: &[Range<Sid>]) -> Result<(), BioEnqueueError> {
+        let current = self.current_sid_range();
+        if ranges.is_empty() || ranges[0].start != current.start {
+            return Err(BioEnqueueError::Refused);
+        }
+
+        let mut expected_start = current.start;
+        for range in ranges {
+            if range.start != expected_start || range.start >= range.end {
+                return Err(BioEnqueueError::Refused);
+            }
+            expected_start = range.end;
+        }
+        if expected_start != current.end {
+            return Err(BioEnqueueError::Refused);
+        }
+        Ok(())
+    }
+
+    /// Computes the sub-set of this bio's segments that cover `range`.
+    ///
+    /// `range` is in the current layer's coordinate system.
+    fn segments_for_child_range(
+        &self,
+        range: &Range<Sid>,
+    ) -> Result<Vec<BioSegment>, BioEnqueueError> {
+        let current_start = apply_offset(self.metadata.sid_range.start, self.sid_offset);
+        let start_sectors = range
+            .start
+            .to_raw()
+            .checked_sub(current_start.to_raw())
+            .ok_or(BioEnqueueError::Refused)?;
+        let end_sectors = range
+            .end
+            .to_raw()
+            .checked_sub(current_start.to_raw())
+            .ok_or(BioEnqueueError::Refused)?;
+        let start = sectors_to_bytes(start_sectors)?;
+        let end = sectors_to_bytes(end_sectors)?;
+
+        let mut segments = Vec::new();
+        let mut cursor = 0usize;
+        for segment in &self.segments {
+            let segment_start = cursor;
+            let segment_end = cursor
+                .checked_add(segment.nbytes())
+                .ok_or(BioEnqueueError::Refused)?;
+            cursor = segment_end;
+
+            let overlap_start = core::cmp::max(start, segment_start);
+            let overlap_end = core::cmp::min(end, segment_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+
+            let relative_start = overlap_start - segment_start;
+            let relative_end = overlap_end - segment_start;
+            segments.push(segment.slice(relative_start..relative_end));
+        }
+
+        let total_len = segments.iter().map(BioSegment::nbytes).sum::<usize>();
+        if total_len != end - start {
+            return Err(BioEnqueueError::Refused);
+        }
+        Ok(segments)
     }
 
     /// Returns the slice to the memory segments.
@@ -280,6 +445,91 @@ impl Debug for SubmittedBio {
     }
 }
 
+/// A handle to coordinate the completion of split bios.
+///
+/// When a [`SubmittedBio`] is split via [`SubmittedBio::split`], a
+/// `SplitBioCompletionHandle` is returned alongside the child bios. Each child
+/// bio, upon completion, reports its status to the shared completion tracker.
+/// When all children have reported, the original bio is completed with the
+/// aggregate status (the first non-`Complete` status wins, or `Complete` if
+/// all children succeeded).
+///
+/// The handle can also be used to manually report a child's failure when the
+/// child cannot be enqueued to an underlying device (e.g., the device returns
+/// `BioEnqueueError`). This ensures the original bio is always completed
+/// exactly once.
+pub struct SplitBioCompletionHandle {
+    inner: Arc<SplitBioCompletion>,
+}
+
+impl SplitBioCompletionHandle {
+    /// Reports that a child bio has completed with the given `status`.
+    ///
+    /// This should be called when a child could not be enqueued to an
+    /// underlying device, or when manual completion tracking is needed.
+    /// Under normal circumstances, the child bio's completion callback
+    /// invokes this automatically.
+    pub fn complete_child(&self, status: BioStatus) {
+        self.inner.complete_child(status);
+    }
+}
+
+/// Internal shared state for coordinating split bio completion.
+struct SplitBioCompletion {
+    /// The number of children that have not yet completed.
+    remaining: AtomicUsize,
+    /// The aggregate status of all children. The first non-`Complete` status
+    /// wins; if all children complete successfully, this stays `Complete`.
+    status: AtomicU32,
+    /// The original bio, completed once all children have reported.
+    original: SpinLock<Option<SubmittedBio>, LocalIrqDisabled>,
+}
+
+impl SplitBioCompletion {
+    fn complete_child(&self, status: BioStatus) {
+        if status != BioStatus::Complete {
+            // Preserve the first non-Complete status.
+            let _ = self.status.compare_exchange(
+                BioStatus::Complete as u32,
+                status as u32,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+        }
+
+        let previous = self.remaining.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+        if previous == 1 {
+            // All children have completed — complete the original bio.
+            let status = BioStatus::try_from(self.status.load(Ordering::Acquire)).unwrap();
+            let original = self
+                .original
+                .lock()
+                .take()
+                .expect("split BIO original must complete exactly once");
+            original.complete(status);
+        }
+    }
+}
+
+/// Applies a signed offset to a `Sid`, returning the adjusted `Sid`.
+///
+/// This is used to compute the current (physical) sector range from the
+/// original logical range and the accumulated `sid_offset`. The caller is
+/// responsible for ensuring the result does not underflow.
+fn apply_offset(sid: Sid, offset: i64) -> Sid {
+    let raw = sid.to_raw() as i64 + offset;
+    Sid::new(raw as u64)
+}
+
+/// Converts a sector count to a byte count, returning an error on overflow.
+fn sectors_to_bytes(sectors: u64) -> Result<usize, BioEnqueueError> {
+    usize::try_from(sectors)
+        .ok()
+        .and_then(|sectors| sectors.checked_mul(SECTOR_SIZE))
+        .ok_or(BioEnqueueError::Refused)
+}
+
 /// The metadata and waitable state shared by submitted `Bio`s and their waiter handles.
 struct BioMetadata {
     /// The type of the I/O
@@ -314,11 +564,11 @@ impl IoCompletion for BioMetadata {
         });
 
         match status {
-            BioStatus::Complete => Ok(()),
+            BioStatus::Complete | BioStatus::Zeros => Ok(()),
             BioStatus::NotSupported => Err(IoError::Unsupported),
             BioStatus::NoSpace => Err(IoError::OutOfSpace),
             BioStatus::IoError => Err(IoError::Failed),
-            BioStatus::Init | BioStatus::Submit | BioStatus::Zeros => unreachable!(),
+            BioStatus::Init | BioStatus::Submit => unreachable!(),
         }
     }
 }
@@ -480,12 +730,43 @@ impl BioSegment {
         &self.inner.dma_slice
     }
 
+    /// Creates a sub-slice of this segment covering the given byte range.
+    ///
+    /// The `range` is relative to the start of this segment and must be
+    /// sector-aligned. If the range covers the entire segment, a clone is
+    /// returned without allocating a new inner.
+    fn slice(&self, range: Range<usize>) -> Self {
+        assert!(is_sector_aligned(range.start) && is_sector_aligned(range.end - range.start));
+        if range.start == 0 && range.end == self.nbytes() {
+            return self.clone();
+        }
+        Self {
+            inner: Arc::new(BioSegmentInner {
+                dma_slice: self.inner.dma_slice.slice(range),
+                direction: self.inner.direction,
+                from_pool: false,
+            }),
+        }
+    }
+
     /// Returns the inner DMA object.
     ///
     /// Note that the slicing will be ignored. This is only for testing.
     #[cfg(ktest)]
     pub fn inner_dma(&self) -> &Arc<DmaStream> {
         self.inner.dma_slice.mem_obj()
+    }
+
+    /// Allocates a segment of exactly `len` bytes.
+    ///
+    /// The length must be non-zero and sector-aligned. This helper is
+    /// intended for ktests that need to submit bios shorter than one
+    /// `BLOCK_SIZE`.
+    #[cfg(ktest)]
+    pub fn alloc_with_len(len: usize, direction: BioDirection) -> Self {
+        assert!(len > 0 && len.is_multiple_of(SECTOR_SIZE));
+        let nblocks = len.div_ceil(BLOCK_SIZE);
+        Self::alloc_inner(nblocks, 0, len, direction)
     }
 }
 

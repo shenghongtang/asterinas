@@ -1,0 +1,67 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! The `error` target.
+//!
+//! Every read and write fails with an I/O error. It is used to fence off
+//! regions that must never be accessed and to exercise error paths.
+//!
+//! Reference: Linux `Documentation/admin-guide/device-mapper/zero.rst`
+//! (the `error` target is documented alongside `zero`).
+
+use alloc::{sync::Arc, vec::Vec};
+
+use aster_block::{
+    BlockDevice, BlockDeviceMeta,
+    bio::{BioEnqueueError, BioStatus, SubmittedBio},
+};
+use device_id::DeviceId;
+
+use crate::target::Target;
+
+/// An `error` target.
+#[derive(Debug)]
+pub struct ErrorTarget {
+    num_sectors: u64,
+}
+
+/// Registers the `error` target type and its version.
+pub fn register() {
+    crate::register_target_type("error", [1, 0, 0]);
+}
+
+impl ErrorTarget {
+    /// Creates a new `error` target.
+    pub fn new(num_sectors: u64) -> Self {
+        Self { num_sectors }
+    }
+}
+
+impl Target for ErrorTarget {
+    fn name(&self) -> &str {
+        "error"
+    }
+
+    fn map_bio(&self, bio: SubmittedBio, _logical_start: u64) -> Result<(), BioEnqueueError> {
+        bio.complete(BioStatus::IoError);
+        Ok(())
+    }
+
+    fn metadata(&self) -> BlockDeviceMeta {
+        BlockDeviceMeta {
+            max_nr_segments_per_bio: usize::MAX,
+            nr_sectors: self.num_sectors as usize,
+        }
+    }
+
+    fn params(&self) -> &str {
+        ""
+    }
+
+    fn deps(&self) -> &[DeviceId] {
+        &[]
+    }
+
+    fn underlying_devices(&self) -> Vec<Arc<dyn BlockDevice>> {
+        Vec::new()
+    }
+}

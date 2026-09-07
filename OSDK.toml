@@ -24,6 +24,14 @@ kcmd_args = [
 init_args = ["sh", "-l"]
 
 # Special options for testing
+# Special options for testing
+[test.boot]
+# The dm component depends on aster-cmdline, whose early cmdline parser
+# disables the early UART console unless "earlycon" is present in the kernel
+# command line. Without it, ktest results are printed nowhere and OSDK test
+# runs appear to hang/fail silently in headless containers.
+kcmd_args = ["earlycon"]
+
 [test.qemu]
 args = "$(./tools/qemu_args.sh test)"
 

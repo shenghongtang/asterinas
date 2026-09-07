@@ -79,6 +79,9 @@ mod ioctl_defs {
     /// Returns the device size in bytes.
     pub(super) type BlkGetSize64 = ioc!(BLKGETSIZE64, 0x12, 114, OutData<u64>);
 
+    /// Returns the device size in 512-byte sectors (legacy interface).
+    pub(super) type BlkGetSize = ioc!(BLKGETSIZE, 0x1260, OutData<u64>);
+
     /// Returns the logical sector size of the block device.
     ///
     /// This is the smallest unit of I/O the device can address and,
@@ -93,6 +96,19 @@ mod ioctl_defs {
     /// ioctl must return that larger value. Otherwise user programs will align
     /// correctly for the device but still hit `EINVAL` at the filesystem.
     pub(super) type BlkGetSectorSize = ioc!(BLKSSZGET, 0x12, 104, NoData);
+
+    /// Returns the current readahead value (in 512-byte sectors).
+    ///
+    /// Used by `dmsetup info` and other tools to display the device's
+    /// read-ahead setting. Asterinas does not implement readahead tuning,
+    /// so a fixed default of 128 sectors (64 KiB) is returned.
+    pub(super) type BlkRaGet = ioc!(BLKRAGET, 0x12, 99, NoData);
+
+    /// Sets the readahead value (in 512-byte sectors).
+    ///
+    /// Asterinas ignores the value and keeps the default readahead, but
+    /// returns success so that userspace tools (e.g., `dmsetup`) don't fail.
+    pub(super) type BlkRaSet = ioc!(BLKRASET, 0x12, 98, NoData);
 }
 
 /// Represents a block device inode in the filesystem.
@@ -231,6 +247,23 @@ impl PerOpenFileOps for OpenBlockFile {
             cmd @ BlkGetSize64 => {
                 let size = (self.0.metadata().nr_sectors * SECTOR_SIZE) as u64;
                 cmd.write(&size)?;
+                Ok(0)
+            }
+            cmd @ BlkGetSize => {
+                let sectors = self.0.metadata().nr_sectors as u64;
+                cmd.write(&sectors)?;
+                Ok(0)
+            }
+            _cmd @ BlkRaGet => {
+                // Return a fixed readahead value (in 512-byte sectors).
+                // Asterinas does not implement readahead tuning; the value
+                // only satisfies userspace tools like `dmsetup info`.
+                let readahead_sectors: i32 = 128;
+                current_userspace!().write_val(raw_ioctl.arg(), &readahead_sectors)?;
+                Ok(0)
+            }
+            _cmd @ BlkRaSet => {
+                // Ignore the value; Asterinas does not tune readahead.
                 Ok(0)
             }
             _ => return_errno_with_message!(

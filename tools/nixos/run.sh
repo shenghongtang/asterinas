@@ -70,6 +70,42 @@ case "$MODE" in
         ;;
 esac
 
+# Support an extra disk for device mapper testing.
+# Usage: DM_DISK=/path/to/disk.img make run_nixos
+#        DM_DISK_SIZE=512 make run_nixos  (auto-create a 512MB disk)
+if [ -n "${DM_DISK}" ]; then
+    DM_DISK_PATH="${DM_DISK}"
+    # Auto-create the disk if it doesn't exist
+    if [ ! -f "${DM_DISK_PATH}" ]; then
+        DM_DISK_SIZE=${DM_DISK_SIZE:-512}
+        echo "Creating DM test disk at ${DM_DISK_PATH} (${DM_DISK_SIZE}MB)..."
+        qemu-img create -f raw "${DM_DISK_PATH}" "${DM_DISK_SIZE}M" >/dev/null
+    fi
+    QEMU_ARGS="${QEMU_ARGS} \
+        -drive if=none,format=raw,id=dm0,file=${DM_DISK_PATH},cache=writethrough \
+        -device virtio-blk-pci,drive=dm0,disable-legacy=on,disable-modern=off \
+    "
+    echo "DM test disk: ${DM_DISK_PATH} -> /dev/vde"
+fi
+
+# Support a second extra disk for device mapper testing.
+# Usage: DM_DISK2=/path/to/disk2.img make run_nixos
+#        DM_DISK2_SIZE=512 make run_nixos  (auto-create a 512MB disk)
+if [ -n "${DM_DISK2}" ]; then
+    DM_DISK2_PATH="${DM_DISK2}"
+    # Auto-create the disk if it doesn't exist
+    if [ ! -f "${DM_DISK2_PATH}" ]; then
+        DM_DISK2_SIZE=${DM_DISK2_SIZE:-512}
+        echo "Creating DM test disk 2 at ${DM_DISK2_PATH} (${DM_DISK2_SIZE}MB)..."
+        qemu-img create -f raw "${DM_DISK2_PATH}" "${DM_DISK2_SIZE}M" >/dev/null
+    fi
+    QEMU_ARGS="${QEMU_ARGS} \
+        -drive if=none,format=raw,id=dm1,file=${DM_DISK2_PATH},cache=writethrough \
+        -device virtio-blk-pci,drive=dm1,disable-legacy=on,disable-modern=off \
+    "
+    echo "DM test disk 2: ${DM_DISK2_PATH} -> /dev/vdf"
+fi
+
 if [ "${ENABLE_KVM}" = "1" ]; then
     QEMU_ARGS="${QEMU_ARGS} -accel kvm"
 fi

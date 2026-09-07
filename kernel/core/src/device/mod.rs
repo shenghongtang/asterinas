@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
+mod dm;
 mod evdev;
 mod fb;
 mod mem;
@@ -57,12 +58,14 @@ pub(crate) fn init_in_first_kthread() {
     misc::init_in_first_kthread();
     evdev::init_in_first_kthread();
     fb::init_in_first_kthread();
+    dm::init_in_first_kthread();
 }
 
 /// Initializes device state after mounting rootfs.
 pub(crate) fn init_in_first_process() -> Result<()> {
     tty::init_in_first_process()?;
     registry::init_in_first_process()?;
+    dm::init_in_first_process();
 
     Ok(())
 }
