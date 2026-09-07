@@ -33,14 +33,12 @@ use ostd::mm::VmIo;
 use super::ioctl_defs::*;
 use crate::{
     context::current_userspace,
-    device::{Device, DeviceType, DevtmpfsInodeMeta, add_node, registry::char},
+    device::{Device, DeviceType, registry::char},
     events::IoEvents,
     fs::{
+        devtmpfs::{DevtmpfsNode, DevtmpfsNodeMeta, create_node, delete_node},
         file::{PerOpenFileOps, StatusFlags},
-        vfs::{
-            inode::FileOps,
-            path::{FsPath, Path, PathResolver},
-        },
+        vfs::{inode::FileOps, path::Path},
     },
     prelude::*,
     process::signal::{PollHandle, Pollable},
@@ -86,8 +84,8 @@ impl Device for DmControlDevice {
         self.id
     }
 
-    fn devtmpfs_meta(&self) -> Option<DevtmpfsInodeMeta<'_>> {
-        Some(DevtmpfsInodeMeta::new("mapper/control"))
+    fn devtmpfs_meta(&self) -> Option<DevtmpfsNodeMeta> {
+        DevtmpfsNodeMeta::new("mapper/control").ok()
     }
 
     fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
@@ -142,21 +140,6 @@ impl PerOpenFileOps for DmControlFile {
 // Devtmpfs node management
 // ---------------------------------------------------------------------------
 
-/// Runs a closure with the current thread's `PathResolver`.
-///
-/// Returns `None` if called outside a POSIX thread context (e.g., in a
-/// kernel thread or during early boot).
-fn with_path_resolver<F, R>(f: F) -> Option<R>
-where
-    F: FnOnce(&PathResolver) -> R,
-{
-    let task = ostd::task::Task::current()?;
-    let thread_local = AsThreadLocal::as_thread_local(&task)?;
-    let fs = thread_local.borrow_fs();
-    let resolver = fs.resolver().read();
-    Some(f(&resolver))
-}
-
 /// Creates devtmpfs nodes for a mapped device.
 ///
 /// Two block device nodes are created, both with the correct dev:
@@ -166,57 +149,53 @@ where
 /// Without this, libdevmapper creates `/dev/mapper/<name>` with dev=0
 /// because there is no udev daemon to set the correct dev.
 pub(super) fn create_dev_node(name: &str, dev_id: u64, minor: u32) {
-    with_path_resolver(|resolver| {
-        // Create /dev/dm-<minor> block device node.
-        let dm_name = format!("dm-{}", minor);
-        let meta = DevtmpfsInodeMeta::new(&dm_name);
-        // Remove existing node first (e.g., from a previous create that failed).
-        if let Ok(dev_dir) = resolver.lookup(&FsPath::try_from("/dev").unwrap()) {
-            let _ = dev_dir.unlink(&dm_name);
-        }
-        if let Err(e) = add_node(DeviceType::Block, dev_id, &meta, resolver) {
-            ostd::warn!(
-                "failed to create /dev/{} for dm device '{}': {:?}",
-                dm_name,
-                name,
-                e
-            );
-        }
+    let Some(id) = DeviceId::from_encoded_u64(dev_id) else {
+        ostd::warn!("invalid device id {} for dm device '{}'", dev_id, name);
+        return;
+    };
 
-        // Create /dev/mapper/<name> as a block device node with the correct
-        // dev. libdevmapper may later call mknod() to (re)create this node;
-        // the ramfs mknod handler replaces existing device nodes and resolves
-        // the correct dev from the DM registry, so the node stays consistent.
-        let mapper_path = format!("mapper/{}", name);
-        let mapper_meta = DevtmpfsInodeMeta::new(&mapper_path);
-        if let Err(e) = add_node(DeviceType::Block, dev_id, &mapper_meta, resolver) {
-            ostd::warn!(
-                "failed to create /dev/mapper/{} for dm device: {:?}",
-                name,
-                e
-            );
-        }
-    });
+    // Create /dev/dm-<minor> block device node.
+    let dm_path = format!("dm-{}", minor);
+    create_node_quietly(id, &dm_path, name);
+
+    // Create /dev/mapper/<name> as a block device node with the correct
+    // dev. libdevmapper may later call mknod() to (re)create this node;
+    // the ramfs mknod handler replaces existing device nodes and resolves
+    // the correct dev from the DM registry, so the node stays consistent.
+    let mapper_path = format!("mapper/{}", name);
+    create_node_quietly(id, &mapper_path, name);
+}
+
+/// Creates a block devtmpfs node, replacing any stale node left by a
+/// previous (possibly failed) create.
+fn create_node_quietly(id: DeviceId, path: &str, name: &str) {
+    let Ok(meta) = DevtmpfsNodeMeta::new(path.to_string()) else {
+        ostd::warn!("invalid devtmpfs path '{}' for dm device '{}'", path, name);
+        return;
+    };
+    // Remove existing node first (e.g., from a previous create that failed).
+    let _ = delete_node(DevtmpfsNode::new(DeviceType::Block, id, meta.clone()));
+    if let Err(e) = create_node(DevtmpfsNode::new(DeviceType::Block, id, meta)) {
+        ostd::warn!(
+            "failed to create /dev/{} for dm device '{}': {:?}",
+            path,
+            name,
+            e
+        );
+    }
 }
 
 /// Removes devtmpfs nodes for a mapped device.
-fn remove_dev_node(name: &str, minor: u32) {
-    with_path_resolver(|resolver| {
-        // Remove /dev/mapper/<name>.
-        if let Ok(mapper_dir) = resolver.lookup(&FsPath::try_from("/dev/mapper").unwrap())
-            && let Err(e) = mapper_dir.unlink(name)
-        {
-            ostd::debug!("failed to remove /dev/mapper/{}: {:?}", name, e);
+fn remove_dev_node(name: &str, id: DeviceId) {
+    let minor = id.minor().get();
+    for path in [format!("mapper/{}", name), format!("dm-{}", minor)] {
+        let Ok(meta) = DevtmpfsNodeMeta::new(path.clone()) else {
+            continue;
+        };
+        if let Err(e) = delete_node(DevtmpfsNode::new(DeviceType::Block, id, meta)) {
+            ostd::debug!("failed to remove /dev/{} for dm device: {:?}", path, e);
         }
-
-        // Remove /dev/dm-<minor>.
-        if let Ok(dev_dir) = resolver.lookup(&FsPath::try_from("/dev").unwrap()) {
-            let dm_name = format!("dm-{}", minor);
-            if let Err(e) = dev_dir.unlink(&dm_name) {
-                ostd::debug!("failed to remove /dev/{}: {:?}", dm_name, e);
-            }
-        }
-    });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -519,8 +498,7 @@ fn handle_remove_all(header: &mut DmIoctl) -> Result<()> {
     for (name, id) in devices {
         match MappedDevice::remove_by_name(name.as_ref()) {
             Ok(_device) => {
-                let minor = id.minor().get();
-                remove_dev_node(name.as_ref(), minor);
+                remove_dev_node(name.as_ref(), id);
                 removed += 1;
                 ostd::debug!("remove_all: removed dm device '{}' (id={:?})", name, id,);
             }
@@ -678,7 +656,6 @@ fn handle_dev_remove(header: &mut DmIoctl) -> Result<()> {
     let device = lookup_device(header)
         .ok_or_else(|| Error::with_message(Errno::ENXIO, "device not found"))?;
     let name = device.name().to_string();
-    let minor = device.device_id().minor().get();
 
     // IMPORTANT: We do NOT call remove_by_name() (which would unregister the
     // device from the block layer and free its minor).  Instead, we only reset
@@ -701,7 +678,7 @@ fn handle_dev_remove(header: &mut DmIoctl) -> Result<()> {
     // -real/-cow suffixes) correctly return ENXIO after removal.
     let _ = device.set_uuid("");
     // Remove devtmpfs nodes (will be recreated by the next DM_DEV_CREATE).
-    remove_dev_node(&name, minor);
+    remove_dev_node(&name, device.device_id());
     Ok(())
 }
 
@@ -752,7 +729,7 @@ fn handle_dev_rename(header: &mut DmIoctl, arg: usize) -> Result<()> {
     // and create /dev/mapper/<new_name> with the same dev id.
     let dev_id = device.device_id().as_encoded_u64();
     let minor = device.device_id().minor().get();
-    remove_dev_node(old_name.as_ref(), minor);
+    remove_dev_node(old_name.as_ref(), device.device_id());
     create_dev_node(&new_name, dev_id, minor);
 
     ostd::info!(
