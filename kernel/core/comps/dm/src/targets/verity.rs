@@ -444,6 +444,15 @@ impl VerityTarget {
             ctx.start();
         }
     }
+
+    /// Returns the pre-formatted parameters string for `DM_TABLE_STATUS`.
+    ///
+    /// This is an inherent method (not the [`Target::params`] trait method) so
+    /// that it can be called directly on a `VerityTarget` value without first
+    /// wrapping it in an `Arc`. The trait implementation delegates to this.
+    pub fn params(&self) -> &str {
+        &self.params
+    }
 }
 
 /// Sentinel value for [`VerityReadInner::level_rev_idx`] meaning "the next

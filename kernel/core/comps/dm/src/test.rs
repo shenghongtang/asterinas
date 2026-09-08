@@ -3,7 +3,6 @@
 #![cfg(ktest)]
 
 use alloc::{
-    boxed::Box,
     format,
     string::{String, ToString},
     sync::Arc,
@@ -27,7 +26,7 @@ use ostd::{
 };
 
 use crate::{
-    DmTable, DmTarget, MappedDevice, Target,
+    DmTable, DmTarget, MappedDevice,
     targets::{linear::LinearTarget, striped::StripedTarget, verity::VerityTarget},
 };
 

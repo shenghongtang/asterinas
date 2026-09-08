@@ -31,6 +31,16 @@ use crate::{
     target::{DmTarget, Target},
 };
 
+/// The maximum number of table-entry-aligned sub-ranges a single bio is
+/// expected to span, stored inline by [`BioParts`] before spilling to the heap.
+const BIO_PARTS_INLINE_CAP: usize = 4;
+
+/// The result of splitting a bio's sector range into table-entry-aligned parts.
+///
+/// Each element is a sub-range (in the table's logical sector coordinates) and
+/// a reference to the table entry that handles I/O for that sub-range.
+type BioParts<'a> = SmallVec<[(Range<Sid>, &'a TableEntry); BIO_PARTS_INLINE_CAP]>;
+
 /// A device mapper table mapping logical sectors to targets.
 ///
 /// The table is immutable after construction. To modify the mapping of a
@@ -218,7 +228,7 @@ impl DmTable {
         }
 
         // The bio spans multiple targets - split it at the boundaries.
-        let ranges: SmallVec<[Range<Sid>; 4]> =
+        let ranges: SmallVec<[Range<Sid>; BIO_PARTS_INLINE_CAP]> =
             parts.iter().map(|(range, _)| range.clone()).collect();
         let (children, completion) = bio.split(&ranges)?;
 
@@ -237,11 +247,7 @@ impl DmTable {
     ///
     /// Each returned tuple contains the sub-range (in the current layer's
     /// coordinate system) and a reference to the table entry that handles it.
-    fn bio_parts(
-        &self,
-        start: u64,
-        end: u64,
-    ) -> Result<SmallVec<[(Range<Sid>, &TableEntry); 4]>, BioEnqueueError> {
+    fn bio_parts(&self, start: u64, end: u64) -> Result<BioParts<'_>, BioEnqueueError> {
         let mut cursor = start;
         let mut parts = SmallVec::new();
         while cursor < end {
