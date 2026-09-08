@@ -31,7 +31,6 @@
 //! # Current limitations
 //!
 //! - Only linear, striped, zero, error, and verity targets are implemented.
-//! - Verity verification is synchronous.
 //!
 //! # Usage (kernel API)
 //!
@@ -626,9 +625,8 @@ impl MappedDevice {
 
     /// Returns the current open count.
     ///
-    /// The value is always zero today because the block layer does not yet
-    /// expose an open/close hook. It is exposed here so that ioctl status
-    /// responses can report a consistent value when such tracking is added.
+    /// The count is maintained by the block-layer `open`/`close` hooks and
+    /// is reported to userspace in ioctl status responses.
     pub fn open_count(&self) -> u32 {
         self.open_count.load(Ordering::Acquire)
     }
@@ -840,7 +838,13 @@ impl BlockDevice for MappedDevice {
     }
 
     fn close(&self) {
-        self.open_count.fetch_sub(1, Ordering::AcqRel);
+        // Guard against an unbalanced close wrapping the counter to
+        // `u32::MAX`; a saturating decrement keeps the count at zero.
+        let _ = self
+            .open_count
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            });
     }
 }
 

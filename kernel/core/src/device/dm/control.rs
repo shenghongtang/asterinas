@@ -11,17 +11,22 @@
 //! | Command           | Description                          |
 //! |-------------------|--------------------------------------|
 //! | `DM_VERSION`      | Return the DM ioctl version          |
+//! | `DM_REMOVE_ALL`   | Remove all mapped devices            |
 //! | `DM_LIST_DEVICES` | List all mapped devices              |
 //! | `DM_DEV_CREATE`   | Create a new mapped device           |
 //! | `DM_DEV_REMOVE`   | Remove a mapped device               |
+//! | `DM_DEV_RENAME`   | Rename a device or its UUID          |
 //! | `DM_DEV_SUSPEND`  | Suspend or resume a device           |
 //! | `DM_DEV_STATUS`   | Get device status                    |
+//! | `DM_DEV_WAIT`     | Wait for an event on a device        |
 //! | `DM_TABLE_LOAD`   | Load a target table into a device    |
 //! | `DM_TABLE_CLEAR`  | Clear the target table of a device   |
 //! | `DM_TABLE_DEPS`   | List underlying devices of a table   |
 //! | `DM_TABLE_STATUS` | Get the current table of a device    |
 //! | `DM_LIST_VERSIONS`| List supported target types          |
+//! | `DM_TARGET_MSG`   | Send a message to a target           |
 //! | `DM_DEV_SET_GEOMETRY` | Set device geometry (no-op)     |
+//! | `DM_GET_TARGET_VERSION` | Get the version of a target type |
 
 use alloc::format;
 use core::ops::{Deref, DerefMut};
@@ -57,6 +62,23 @@ const DM_CTRL_MAJOR: MajorId = MajorId::new(10);
 /// as a misc device with minor 236 (`MAPPER_CTRL_MINOR`).
 /// Reference: <https://elixir.bootlin.com/linux/v6.13/source/include/uapi/linux/misc.h#L63>
 const DM_CTRL_MINOR: MinorId = MinorId::new(236);
+
+/// Fixed part of a `dm_name_list` entry: dev(8) + next(4).
+const NAME_LIST_ENTRY_FIXED: usize = 8 + 4;
+
+/// Header of a `dm_target_deps` response: count(4) + padding(4).
+const TARGET_DEPS_HEADER_SIZE: usize = 4 + 4;
+
+/// Fixed part of a `dm_target_versions` entry: next(4) + version\[3\](12).
+const TARGET_VERSIONS_ENTRY_FIXED: usize = 4 + 12;
+
+/// Capacity of the `target_type` field in [`DmTargetSpec`], including the
+/// null terminator.
+const TARGET_TYPE_CAPACITY: usize = 16;
+
+/// Maximum length of the new name/UUID string accepted by `DM_DEV_RENAME`,
+/// matching the capacity of [`DmIoctl::name`].
+const RENAME_VALUE_MAX_LEN: usize = 128;
 
 // ---------------------------------------------------------------------------
 // Device and file handle
@@ -570,7 +592,7 @@ fn handle_list_devices(header: &mut DmIoctl, arg: usize) -> Result<()> {
     // Compute entry sizes: dev(8) + next(4) + name + null, padded to 8.
     let entry_sizes: Vec<usize> = devices
         .iter()
-        .map(|(name, _)| align8(12 + name.len() + 1))
+        .map(|(name, _)| align8(NAME_LIST_ENTRY_FIXED + name.len() + 1))
         .collect();
 
     let total: usize = entry_sizes.iter().sum();
@@ -734,6 +756,13 @@ fn handle_dev_remove(header: &mut DmIoctl) -> Result<()> {
     // reports the device as busy (e.g. a filesystem is mounted on it via a
     // lease), fall back to the legacy reset-only path so the caller can retry
     // after unmounting.
+
+    // Bump the event number before destroying the device so any threads
+    // blocked in DM_DEV_WAIT wake up and don't get stuck forever waiting on
+    // an event that can never come (the device is about to be removed).
+    // Matches Linux's per-device event counter semantics for dev removal.
+    device.bump_event_nr();
+
     match MappedDevice::remove_by_name(&name) {
         Ok(_) => {
             remove_dev_node(&name, id);
@@ -782,7 +811,7 @@ fn handle_dev_rename(header: &mut DmIoctl, arg: usize) -> Result<()> {
 
     // Read the new value from the data area.
     let ds = data_start(header);
-    let new_value = read_cstring_from_user(arg + ds, 128)?;
+    let new_value = read_cstring_from_user(arg + ds, RENAME_VALUE_MAX_LEN)?;
     if new_value.is_empty() {
         return_errno_with_message!(Errno::EINVAL, "new device name/uuid is empty");
     }
@@ -1103,7 +1132,7 @@ fn handle_table_deps(header: &mut DmIoctl, arg: usize) -> Result<()> {
         Some(t) => t,
         None => {
             let ds = data_start(header);
-            let buf = [0u8; 8]; // count=0 + padding=0
+            let buf = [0u8; TARGET_DEPS_HEADER_SIZE]; // count=0 + padding=0
             current_userspace!().write_bytes(arg + ds, &buf)?;
             header.target_count = 0;
             return Ok(());
@@ -1114,9 +1143,9 @@ fn handle_table_deps(header: &mut DmIoctl, arg: usize) -> Result<()> {
     let count = deps.len() as u32;
 
     let ds = data_start(header);
-    // dm_target_deps header: count(4) + padding(4) = 8 bytes
-    // dev array: count * 8 bytes
-    let needed = 8 + deps.len() * 8;
+    // dm_target_deps header: count(4) + padding(4)
+    // dev array: one encoded u64 per dependency
+    let needed = TARGET_DEPS_HEADER_SIZE + deps.len() * size_of::<u64>();
 
     // Always write the count + padding so the caller knows the needed size
     // even if the dev array doesn't fit.
@@ -1204,10 +1233,10 @@ fn handle_table_status(header: &mut DmIoctl, arg: usize) -> Result<()> {
         writer.extend_from_slice(&info.length.to_le_bytes()); // length (8)
         writer.extend_from_slice(&0u32.to_le_bytes()); // status (4)
         writer.extend_from_slice(&next.to_le_bytes()); // next (4)
-        // target_type (16 bytes, null-terminated).
-        let mut tt = [0u8; 16];
+        // target_type (null-terminated, padded to the field capacity).
+        let mut tt = [0u8; TARGET_TYPE_CAPACITY];
         let tt_bytes = info.target_type.as_bytes();
-        let tt_len = tt_bytes.len().min(15);
+        let tt_len = tt_bytes.len().min(TARGET_TYPE_CAPACITY - 1);
         tt[..tt_len].copy_from_slice(&tt_bytes[..tt_len]);
         writer.extend_from_slice(&tt);
 
@@ -1245,7 +1274,7 @@ fn handle_list_versions(header: &mut DmIoctl, arg: usize) -> Result<()> {
     // Compute entry sizes: next(4) + version[3](12) + name + null, padded to 8.
     let entry_sizes: Vec<usize> = targets
         .iter()
-        .map(|(name, _)| align8(4 + 12 + name.len() + 1))
+        .map(|(name, _)| align8(TARGET_VERSIONS_ENTRY_FIXED + name.len() + 1))
         .collect();
 
     let total: usize = entry_sizes.iter().sum();
@@ -1289,7 +1318,7 @@ fn handle_get_target_version(header: &mut DmIoctl, arg: usize) -> Result<()> {
         .ok_or_else(|| Error::with_message(Errno::EINVAL, "unknown target type"))?;
 
     // Single entry: next(4) + version[3](12) + name + null, padded to 8.
-    let entry_size = align8(4 + 12 + target_name.len() + 1);
+    let entry_size = align8(TARGET_VERSIONS_ENTRY_FIXED + target_name.len() + 1);
     let mut writer = DataAreaWriter::with_capacity(entry_size);
     writer.extend_from_slice(&0u32.to_le_bytes()); // next = 0 (single entry)
     for &v in &version {

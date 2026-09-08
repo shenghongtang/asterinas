@@ -28,6 +28,13 @@ use smallvec::SmallVec;
 
 use crate::target::Target;
 
+/// Inline capacity for the stripe ranges a single bio is split into.
+///
+/// A bio spanning more than this many absolute stripes spills to the heap.
+/// Eight stripes already covers an uncommonly wide I/O; typical bios stay
+/// within one or two stripes.
+const SPLIT_RANGES_INLINE_CAP: usize = 8;
+
 /// A single stripe of a [`StripedTarget`].
 struct Stripe {
     /// The underlying block device for this stripe.
@@ -179,9 +186,10 @@ impl Target for StripedTarget {
         let cur_start = cur.start.to_raw();
         let cur_end = cur.end.to_raw();
 
-        // Zero-length bios (e.g., flush) have no sector range to map. Forward
-        // the flush to the first stripe's device, matching the convention that
-        // flush is only forwarded to the first target.
+        // Zero-length non-flush bios have no sector range to map (flush bios
+        // are intercepted by `DmTable::map_flush` and fanned out to all
+        // underlying devices before reaching a target). Forward the bio to
+        // the first stripe's device unchanged.
         if cur_end <= cur_start {
             let delta = self.stripe_delta(0, logical_start)?;
             let new_offset = bio
@@ -215,7 +223,7 @@ impl Target for StripedTarget {
 
         // The bio spans multiple absolute stripes - split at every stripe
         // boundary and forward each child to its (possibly different) device.
-        let mut ranges = SmallVec::<[Range<Sid>; 8]>::new();
+        let mut ranges = SmallVec::<[Range<Sid>; SPLIT_RANGES_INLINE_CAP]>::new();
         let mut cursor = cur_start;
         let mut a = first_abs;
         while a <= last_abs {

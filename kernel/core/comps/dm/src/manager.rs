@@ -183,7 +183,9 @@ impl DmManager {
         // Check name uniqueness.
         if inner.by_name.contains_key(name.as_ref()) {
             drop(inner);
-            let _ = aster_block::unregister(id);
+            // The device was just registered above and cannot have any
+            // leases yet, so unregistration cannot fail.
+            debug_assert!(aster_block::unregister(id).is_ok());
             self.minors.lock().free(minor as usize);
             return Err(DmError::AlreadyRegistered);
         }
@@ -194,7 +196,8 @@ impl DmManager {
             .is_some_and(|uuid| !uuid.is_empty() && inner.by_uuid.contains_key(uuid.as_ref()))
         {
             drop(inner);
-            let _ = aster_block::unregister(id);
+            // Same as above: the freshly registered device cannot be busy.
+            debug_assert!(aster_block::unregister(id).is_ok());
             self.minors.lock().free(minor as usize);
             return Err(DmError::UuidExists);
         }
@@ -238,11 +241,15 @@ impl DmManager {
                 self.guards.lock().remove(&minor);
                 Ok(device)
             }
-            Err(_) => {
-                // The device is busy: restore the registry entry so that the
-                // caller can retry after suspending / draining I/O.
+            Err(err) => {
+                // Restore the registry entry so the device stays manageable
+                // and the caller can retry.
                 let mut inner = self.inner.write();
                 inner.insert(Arc::from(name), device.clone());
+                // `unregister` only fails with `Busy` (outstanding leases)
+                // or `NotFound` (entry missing from the block registry,
+                // which cannot happen for a device registered at creation).
+                debug_assert_eq!(err, aster_block::Error::Busy);
                 Err(DmError::DeviceBusy)
             }
         }

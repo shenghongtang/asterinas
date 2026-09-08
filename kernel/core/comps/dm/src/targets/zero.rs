@@ -60,7 +60,8 @@ impl Target for ZeroTarget {
     fn metadata(&self) -> BlockDeviceMeta {
         BlockDeviceMeta {
             max_nr_segments_per_bio: usize::MAX,
-            nr_sectors: self.num_sectors as usize,
+            // Saturate on 32-bit platforms instead of silently truncating.
+            nr_sectors: usize::try_from(self.num_sectors).unwrap_or(usize::MAX),
         }
     }
 

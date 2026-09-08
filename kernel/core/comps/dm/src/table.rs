@@ -44,8 +44,8 @@ type BioParts<'a> = SmallVec<[(Range<Sid>, &'a TableEntry); BIO_PARTS_INLINE_CAP
 /// A device mapper table mapping logical sectors to targets.
 ///
 /// The table is immutable after construction. To modify the mapping of a
-/// mapped device, create a new table and replace the old one (a future
-/// table-swap mechanism; currently the table is fixed at device creation).
+/// mapped device, create a new table and load it via
+/// [`MappedDevice::load_table`] (used by `DM_TABLE_LOAD` + resume).
 pub struct DmTable {
     /// Sorted, contiguous entries covering the entire mapped device.
     entries: Vec<TableEntry>,
@@ -122,7 +122,10 @@ impl DmTable {
             return Err(TableError::NotContiguous);
         }
 
-        self.total_sectors += num_sectors;
+        self.total_sectors = self
+            .total_sectors
+            .checked_add(num_sectors)
+            .ok_or(TableError::TooLarge)?;
         let target_metadata = target.metadata();
         self.metadata.max_nr_segments_per_bio = self
             .metadata
@@ -162,19 +165,24 @@ impl DmTable {
     /// Used by `DM_TARGET_MSG` to route a message to the correct target.
     /// `sector` is compared against each entry's
     /// `[logical_start, logical_start + num_sectors)` range.
+    ///
+    /// Uses binary search via [`Vec::partition_point`] since entries are
+    /// kept sorted by `logical_start`, giving O(log n) lookup.
     pub fn find_target(&self, sector: u64) -> Option<&DmTarget> {
-        self.entries
-            .iter()
-            .find(|e| sector >= e.logical_start && sector < e.logical_start + e.num_sectors)
-            .map(|e| &e.target)
+        // `partition_point` returns the first index where the predicate is
+        // false. Entries before that index have `logical_start <= sector`, so
+        // the entry at `idx - 1` is the candidate if it covers `sector`.
+        let idx = self.entries.partition_point(|e| e.logical_start <= sector);
+        let entry = idx.checked_sub(1).and_then(|i| self.entries.get(i))?;
+        let entry_end = entry.logical_start + entry.num_sectors;
+        (sector < entry_end).then_some(&entry.target)
     }
 
     /// Maps a submitted bio to the appropriate target and forwards it.
     ///
-    /// Flush bios (which have an empty sector range) are forwarded to the
-    /// first target's underlying device. For multi-target tables, only the
-    /// first target is flushed; a proper implementation would flush all
-    /// unique underlying devices.
+    /// Flush bios (which have an empty sector range) are fanned out to all
+    /// underlying devices referenced by the table, so every target's backing
+    /// device receives the flush.
     ///
     /// If the bio spans multiple targets in the table, it is automatically
     /// split at the target boundaries. Each child bio is forwarded to its
