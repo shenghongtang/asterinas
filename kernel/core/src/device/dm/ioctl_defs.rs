@@ -163,8 +163,15 @@ pub struct DmTargetSpec {
     pub length: u64,
     /// Status - output.
     pub status: u32,
-    /// Offset from the start of `DmIoctl` to the next `DmTargetSpec`
-    /// (0 = last entry).
+    /// Offset to the next `DmTargetSpec` (0 = last entry).
+    ///
+    /// The exact meaning depends on the ioctl direction, matching Linux
+    /// `dm_target_spec.next`:
+    /// - On `DM_TABLE_LOAD` (input): byte offset from the start of the
+    ///   *current* spec to the start of the next spec.
+    /// - On `DM_TABLE_STATUS` (output): byte offset from the start of the
+    ///   *first* spec (immediately after the `DmIoctl` header) to the start
+    ///   of the next spec.
     pub next: u32,
     /// Target type name (null-terminated, e.g. `"linear"`).
     pub target_type: [u8; 16],
