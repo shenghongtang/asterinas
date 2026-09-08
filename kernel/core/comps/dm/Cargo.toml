@@ -13,6 +13,7 @@ device-id.workspace = true
 id-alloc.workspace = true
 io-util.workspace = true
 ostd.workspace = true
+smallvec.workspace = true
 spin.workspace = true
 
 [lints]

@@ -186,14 +186,35 @@ fn create_node_quietly(id: DeviceId, path: &str, name: &str) {
 }
 
 /// Removes devtmpfs nodes for a mapped device.
+///
+/// Each node is removed with revalidation: it is only unlinked if it still
+/// matches the device's type and ID. If the node exists but belongs to a
+/// different device (dev-id mismatch), a stale node is left behind and a
+/// warning is emitted instead of silently ignoring the condition.
 fn remove_dev_node(name: &str, id: DeviceId) {
     let minor = id.minor().get();
     for path in [format!("mapper/{}", name), format!("dm-{}", minor)] {
         let Ok(meta) = DevtmpfsNodeMeta::new(path.clone()) else {
             continue;
         };
-        if let Err(e) = delete_node(DevtmpfsNode::new(DeviceType::Block, id, meta)) {
-            ostd::debug!("failed to remove /dev/{} for dm device: {:?}", path, e);
+        match delete_node(DevtmpfsNode::new(DeviceType::Block, id, meta)) {
+            Ok(true) => {}
+            Ok(false) => {
+                // The node exists but belongs to a different device
+                // (dev-id mismatch). A stale node is left behind; warn so
+                // the condition is not silently ignored.
+                ostd::warn!(
+                    "stale /dev/{} node left behind: dev-id mismatch during dm device removal",
+                    path
+                );
+            }
+            Err(e) if e.error() == Errno::ENOENT => {
+                // Node or parent path does not exist - benign.
+                ostd::debug!("no /dev/{} node to remove for dm device: {:?}", path, e);
+            }
+            Err(e) => {
+                ostd::warn!("failed to remove /dev/{} for dm device: {:?}", path, e);
+            }
         }
     }
 }
@@ -277,6 +298,16 @@ fn handle_ioctl(raw_ioctl: RawIoctl) -> Result<i32> {
         check_data_area(&header)?;
     }
 
+    // `DM_IMA_MEASUREMENT_FLAG` requests an IMA measurement of the ioctl
+    // payload. We do not implement an IMA subsystem, so the flag is noted but
+    // has no effect.
+    if (header.flags & DM_IMA_MEASUREMENT_FLAG) != 0 {
+        ostd::debug!(
+            "dm ioctl nr=0x{:x}: ignoring DM_IMA_MEASUREMENT_FLAG (IMA not implemented)",
+            nr
+        );
+    }
+
     let result = match nr {
         DM_VERSION_NR => Ok(()),
         DM_REMOVE_ALL_NR => handle_remove_all(&mut header),
@@ -287,7 +318,7 @@ fn handle_ioctl(raw_ioctl: RawIoctl) -> Result<i32> {
         DM_DEV_SUSPEND_NR => handle_dev_suspend(&mut header),
         DM_DEV_STATUS_NR => handle_dev_status(&mut header),
         DM_DEV_WAIT_NR => handle_dev_wait(&mut header),
-        DM_TARGET_MSG_NR => handle_target_msg(&mut header),
+        DM_TARGET_MSG_NR => handle_target_msg(&mut header, raw_ioctl.arg()),
         DM_TABLE_LOAD_NR => handle_table_load(&mut header, raw_ioctl.arg()),
         DM_TABLE_CLEAR_NR => handle_table_clear(&mut header),
         DM_TABLE_DEPS_NR => handle_table_deps(&mut header, raw_ioctl.arg()),
@@ -312,7 +343,12 @@ fn handle_ioctl(raw_ioctl: RawIoctl) -> Result<i32> {
     }
 
     // Always write the header back (even on error, to report version info).
-    let _ = current_userspace!().write_val(raw_ioctl.arg(), &header);
+    // A failed write-back means the userspace buffer is invalid, so report
+    // EFAULT (matching Linux's `copy_to_user` failure semantics) instead of
+    // silently swallowing it.
+    current_userspace!()
+        .write_val(raw_ioctl.arg(), &header)
+        .map_err(|_| Error::with_message(Errno::EFAULT, "failed to write dm_ioctl header"))?;
 
     result.map(|_| 0)
 }
@@ -567,6 +603,16 @@ fn handle_dev_create(header: &mut DmIoctl) -> Result<()> {
     if name.is_empty() {
         return_errno_with_message!(Errno::EINVAL, "device name is empty");
     }
+    // `DM_PERSISTENT_DEV_FLAG` requests that the device survive reboots. We
+    // have no persistent DM state, so the device is always ephemeral; the flag
+    // is noted but otherwise ignored (matching kernels without a persistent
+    // metadata backend).
+    if (header.flags & DM_PERSISTENT_DEV_FLAG) != 0 {
+        ostd::debug!(
+            "DM_DEV_CREATE: ignoring DM_PERSISTENT_DEV_FLAG for '{}' (no persistent DM state)",
+            name
+        );
+    }
     let uuid = header.uuid_str().to_string();
     let device = match MappedDevice::create_empty(name.clone()) {
         Ok(device) => device,
@@ -596,6 +642,9 @@ fn handle_dev_create(header: &mut DmIoctl) -> Result<()> {
                         aster_dm::DmError::UuidExists => {
                             Error::with_message(Errno::EEXIST, "uuid already in use")
                         }
+                        aster_dm::DmError::InvalidParameters(msg) => {
+                            Error::with_message(Errno::EINVAL, msg)
+                        }
                         _ => Error::with_message(Errno::EINVAL, "failed to set device uuid"),
                     })?;
                 }
@@ -620,6 +669,12 @@ fn handle_dev_create(header: &mut DmIoctl) -> Result<()> {
                 "minor numbers exhausted",
             ));
         }
+        Err(aster_dm::DmError::MinorBusy) => {
+            return Err(Error::with_message(
+                Errno::EBUSY,
+                "requested minor number is in use",
+            ));
+        }
         Err(_) => {
             return Err(Error::with_message(
                 Errno::EINVAL,
@@ -632,6 +687,7 @@ fn handle_dev_create(header: &mut DmIoctl) -> Result<()> {
             aster_dm::DmError::UuidExists => {
                 Error::with_message(Errno::EEXIST, "uuid already in use")
             }
+            aster_dm::DmError::InvalidParameters(msg) => Error::with_message(Errno::EINVAL, msg),
             _ => Error::with_message(Errno::EINVAL, "failed to set device uuid"),
         })?;
     }
@@ -652,62 +708,112 @@ fn handle_dev_create(header: &mut DmIoctl) -> Result<()> {
 
 /// DM_DEV_REMOVE - removes a mapped device by name or UUID.
 fn handle_dev_remove(header: &mut DmIoctl) -> Result<()> {
+    // `DM_SECURE_DATA_FLAG` requests a cryptographic erase of the device's
+    // data area before removal. We do not implement secure erase, so reject
+    // the request rather than silently removing the device without wiping it.
+    if (header.flags & DM_SECURE_DATA_FLAG) != 0 {
+        return_errno_with_message!(Errno::EOPNOTSUPP, "secure data erase is not supported");
+    }
     // Use the shared lookup so UUID-based removal (used by LVM2) also works.
     let device = lookup_device(header)
         .ok_or_else(|| Error::with_message(Errno::ENXIO, "device not found"))?;
     let name = device.name().to_string();
+    let id = device.device_id();
 
-    // IMPORTANT: We do NOT call remove_by_name() (which would unregister the
-    // device from the block layer and free its minor).  Instead, we only reset
-    // the device state (clear tables, unsuspend) and clear its UUID.
-    //
-    // Rationale: VFS inodes for /dev/<vg>/<lv> nodes (created by LVM2 via
-    // mknod, not managed by our devtmpfs) may cache the Arc<MappedDevice>.
-    // If we unregister the old device and create a fresh one in the next
-    // DM_DEV_CREATE, the VFS inode still points to the OLD device.  This
-    // causes:
-    //   1. BLKGETSIZE64 returns the old device's table size (wrong capacity)
-    //   2. Writes go through the old device's table (potentially wrong mapping)
-    //
-    // By keeping the device registered, the next DM_DEV_CREATE takes the
-    // AlreadyRegistered path (lookup_by_name → found → reset → set_uuid),
-    // which reuses the SAME device Arc.  The VFS inode then points to the
-    // same device, which now has the new table loaded by DM_TABLE_LOAD.
-    device.reset();
-    // Clear the UUID so that UUID-based lookups (e.g., DM_DEV_STATUS for
-    // -real/-cow suffixes) correctly return ENXIO after removal.
-    let _ = device.set_uuid("");
-    // Remove devtmpfs nodes (will be recreated by the next DM_DEV_CREATE).
-    remove_dev_node(&name, device.device_id());
-    Ok(())
-}
-
-/// DM_DEV_RENAME - renames a mapped device.
-///
-/// The existing device is identified by the header's name/UUID/dev fields.
-/// The new name is read from the data area (a null-terminated string at
-/// `data_start`). If `DM_UUID_FLAG` is set, the ioctl would rename the UUID
-/// instead - this is not supported and returns `EOPNOTSUPP`.
-///
-/// On success, the device's internal name, the `DM_DEVICES` registry key,
-/// and the `/dev/mapper/<name>` devtmpfs node are all updated. The
-/// `/dev/dm-<minor>` node is keyed by minor number and is unchanged.
-fn handle_dev_rename(header: &mut DmIoctl, arg: usize) -> Result<()> {
-    if (header.flags & DM_UUID_FLAG) != 0 {
-        return_errno_with_message!(Errno::EOPNOTSUPP, "renaming the DM UUID is not supported");
+    // Refuse to remove a device that still has open file descriptors. The
+    // block-layer lease check inside `remove_by_name` catches nested-DM
+    // underlying leases but not userspace opens; the open count (maintained
+    // by the BlockDevice::open/close hooks, see P1-2) covers that gap.
+    if device.open_count() > 0 {
+        return_errno_with_message!(Errno::EBUSY, "device is open and cannot be removed");
     }
 
+    // Attempt a full unregister: removes the device from the DM and block
+    // registries and recycles its minor number. This fixes the minor leak and
+    // the `dmsetup ls` residual-device problems (P1-3). If the block layer
+    // reports the device as busy (e.g. a filesystem is mounted on it via a
+    // lease), fall back to the legacy reset-only path so the caller can retry
+    // after unmounting.
+    match MappedDevice::remove_by_name(&name) {
+        Ok(_) => {
+            remove_dev_node(&name, id);
+            ostd::info!("removed dm device '{}' (id={:?})", name, id);
+            Ok(())
+        }
+        Err(aster_dm::DmError::DeviceBusy) => {
+            // Busy (e.g. mounted filesystem holding a lease): keep the device
+            // registered but clear its tables and UUID, matching the legacy
+            // behavior. The device will be fully removable once the lease is
+            // released.
+            ostd::debug!("dm device '{}' is busy; falling back to reset", name);
+            device.reset();
+            let _ = device.set_uuid("");
+            remove_dev_node(&name, id);
+            Ok(())
+        }
+        Err(aster_dm::DmError::NotFound) => {
+            Err(Error::with_message(Errno::ENXIO, "device not found"))
+        }
+        Err(_) => Err(Error::with_message(
+            Errno::EINVAL,
+            "failed to remove device",
+        )),
+    }
+}
+
+/// DM_DEV_RENAME - renames a mapped device (name or UUID).
+///
+/// The existing device is identified by the header's name/UUID/dev fields.
+/// The new value (name or UUID) is read from the data area (a
+/// null-terminated string at `data_start`).
+///
+/// - Without `DM_UUID_FLAG`: renames the device. The device's internal
+///   name, the `DM_DEVICES` registry key, and the `/dev/mapper/<name>`
+///   devtmpfs node are all updated. The `/dev/dm-<minor>` node is keyed
+///   by minor number and is unchanged.
+/// - With `DM_UUID_FLAG`: renames the device's UUID. The UUID index in
+///   the registry and the device's internal UUID field are updated
+///   atomically. No devtmpfs nodes change (they are keyed by name/minor).
+fn handle_dev_rename(header: &mut DmIoctl, arg: usize) -> Result<()> {
     // Identify the existing device by name/UUID/dev in the header.
     let device = lookup_device(header)
         .ok_or_else(|| Error::with_message(Errno::ENXIO, "device not found"))?;
     let old_name = device.name();
 
-    // Read the new name from the data area.
+    // Read the new value from the data area.
     let ds = data_start(header);
-    let new_name = read_cstring_from_user(arg + ds, 128)?;
-    if new_name.is_empty() {
-        return_errno_with_message!(Errno::EINVAL, "new device name is empty");
+    let new_value = read_cstring_from_user(arg + ds, 128)?;
+    if new_value.is_empty() {
+        return_errno_with_message!(Errno::EINVAL, "new device name/uuid is empty");
     }
+
+    if (header.flags & DM_UUID_FLAG) != 0 {
+        // Rename the UUID.
+        let new_uuid = new_value;
+        // No-op if the UUID is unchanged.
+        if new_uuid == device.uuid().as_ref() {
+            update_dev_status(header, &device);
+            return Ok(());
+        }
+        device.set_uuid(&new_uuid).map_err(|e| match e {
+            aster_dm::DmError::NotFound => Error::with_message(Errno::ENXIO, "device not found"),
+            aster_dm::DmError::UuidExists => {
+                Error::with_message(Errno::EEXIST, "new UUID already in use")
+            }
+            _ => Error::with_message(Errno::EINVAL, "failed to rename UUID"),
+        })?;
+        ostd::info!(
+            "renamed dm device '{}' UUID -> '{}' (id={:?})",
+            old_name,
+            new_uuid,
+            device.device_id(),
+        );
+        header.set_uuid(&new_uuid);
+        update_dev_status(header, &device);
+        return Ok(());
+    }
+
+    let new_name = new_value;
 
     // No-op if the name is unchanged.
     if new_name == old_name.as_ref() {
@@ -753,6 +859,15 @@ fn handle_dev_rename(header: &mut DmIoctl, arg: usize) -> Result<()> {
 fn handle_dev_suspend(header: &mut DmIoctl) -> Result<()> {
     let device = lookup_device(header)
         .ok_or_else(|| Error::with_message(Errno::ENXIO, "device not found"))?;
+    // `DM_SKIP_LOCKFS_FLAG` and `DM_SKIP_BDGET_FLAG` are hints for upper layers
+    // (filesystem freeze, block device open tracking) that we do not implement;
+    // the suspend itself still works correctly without them.
+    if (header.flags & (DM_SKIP_LOCKFS_FLAG | DM_SKIP_BDGET_FLAG)) != 0 {
+        ostd::debug!(
+            "DM_DEV_SUSPEND: ignoring SKIP_LOCKFS/SKIP_BDGET hints for '{}'",
+            device.name()
+        );
+    }
     let suspend = (header.flags & DM_SUSPEND_FLAG) != 0;
     if suspend && (header.flags & DM_NOFLUSH_FLAG) != 0 {
         device.set_suspended_no_flush(true);
@@ -804,15 +919,44 @@ fn handle_dev_wait(header: &mut DmIoctl) -> Result<()> {
     Ok(())
 }
 
-/// DM_TARGET_MSG - passes a message to a target.
+/// DM_TARGET_MSG - passes a message to the target covering `sector`.
 ///
-/// Target messages are not supported; return `EOPNOTSUPP` so userspace
-/// tools can detect the lack of support gracefully.
-fn handle_target_msg(_header: &mut DmIoctl) -> Result<()> {
-    Err(Error::with_message(
-        Errno::EOPNOTSUPP,
-        "target messages not supported",
-    ))
+/// The data area contains a `DmTargetMsg` (8-byte `sector`) followed by a
+/// null-terminated message string. The message is routed to the target whose
+/// region contains `sector`; targets that do not implement messages return
+/// `EINVAL` ("target message not supported").
+fn handle_target_msg(header: &mut DmIoctl, arg: usize) -> Result<()> {
+    let device = lookup_device(header)
+        .ok_or_else(|| Error::with_message(Errno::ENXIO, "device not found"))?;
+
+    let ds = data_start(header);
+    let data_size = header.data_size as usize - ds;
+
+    // The data area must hold at least the 8-byte `DmTargetMsg` header.
+    if data_size < size_of::<DmTargetMsg>() {
+        return_errno_with_message!(Errno::EINVAL, "target message payload too small");
+    }
+    let msg: DmTargetMsg = current_userspace!()
+        .read_val(arg + ds)
+        .map_err(|_| Error::with_message(Errno::EFAULT, "failed to read target message"))?;
+
+    // The null-terminated message string follows the `sector` field.
+    let str_start = arg + ds + size_of::<DmTargetMsg>();
+    let str_len = header.data_size as usize - ds - size_of::<DmTargetMsg>();
+    let message = read_cstring_from_user(str_start, str_len)
+        .map_err(|_| Error::with_message(Errno::EINVAL, "invalid message string"))?;
+
+    device
+        .target_message(msg.sector, &message)
+        .map_err(|e| match e {
+            aster_dm::DmError::NotFound => {
+                Error::with_message(Errno::EINVAL, "no target covers the given sector")
+            }
+            aster_dm::DmError::InvalidParameters(msg) => Error::with_message(Errno::EINVAL, msg),
+            _ => Error::with_message(Errno::EINVAL, "target message failed"),
+        })?;
+
+    Ok(())
 }
 
 /// DM_TABLE_LOAD - reads target specs from the data area and loads a table.
@@ -845,10 +989,22 @@ fn handle_table_load(header: &mut DmIoctl, arg: usize) -> Result<()> {
 
         // Guard against reading params beyond the data area; cap the read at
         // the remaining bytes after the spec.
-        let params_max = core::cmp::min(
-            256,
-            data_size.saturating_sub(offset + size_of::<DmTargetSpec>()),
-        );
+        // `spec.next` is the offset from this spec to the next one (Linux
+        // `dm_target_spec.next` semantics). Params run from the end of this
+        // spec to the next spec (or the data-area end for the last spec).
+        // This replaces a previous hard-coded 256-byte cap that silently
+        // truncated large params (e.g. long dm-verity root digests).
+        const MAX_PARAMS_LEN: usize = 64 * 1024;
+        let params_max = if spec.next == 0 {
+            data_size.saturating_sub(offset + size_of::<DmTargetSpec>())
+        } else {
+            let next = spec.next as usize;
+            if next < size_of::<DmTargetSpec>() {
+                return_errno_with_message!(Errno::EINVAL, "target spec next offset too small");
+            }
+            next - size_of::<DmTargetSpec>()
+        };
+        let params_max = params_max.min(MAX_PARAMS_LEN);
         if params_max == 0 {
             return Err(Error::with_message(
                 Errno::EINVAL,
@@ -857,7 +1013,7 @@ fn handle_table_load(header: &mut DmIoctl, arg: usize) -> Result<()> {
         }
 
         // Read the params string (starts right after the spec).
-        let params = read_cstring_from_user(base + offset + 40, params_max)?;
+        let params = read_cstring_from_user(base + offset + size_of::<DmTargetSpec>(), params_max)?;
 
         let target_type = spec.target_type_str();
         let target = super::parser::parse_target(target_type, &params, spec.length)?;
@@ -870,20 +1026,16 @@ fn handle_table_load(header: &mut DmIoctl, arg: usize) -> Result<()> {
                 TableError::NotContiguous => {
                     Error::with_message(Errno::EINVAL, "targets must be contiguous")
                 }
+                TableError::TooLarge => {
+                    Error::with_message(Errno::EINVAL, "table sector count too large")
+                }
                 _ => Error::with_message(Errno::EINVAL, "invalid table"),
             })?;
 
         if spec.next == 0 {
             break;
         }
-        let next = spec.next as usize;
-        if next < size_of::<DmTargetSpec>() {
-            return Err(Error::with_message(
-                Errno::EINVAL,
-                "target spec next offset too small",
-            ));
-        }
-        offset = offset.checked_add(next).ok_or_else(|| {
+        offset = offset.checked_add(spec.next as usize).ok_or_else(|| {
             Error::with_message(Errno::EINVAL, "target spec next offset overflow")
         })?;
         if offset > data_size {
@@ -894,9 +1046,14 @@ fn handle_table_load(header: &mut DmIoctl, arg: usize) -> Result<()> {
         }
     }
 
-    device
-        .load_table(table)
-        .map_err(|_| Error::with_message(Errno::EINVAL, "failed to load table"))?;
+    device.load_table(table).map_err(|e| match e {
+        aster_dm::DmError::InvalidTable(_) => Error::with_message(Errno::EINVAL, "invalid table"),
+        aster_dm::DmError::TableAlreadyLoaded => {
+            Error::with_message(Errno::EEXIST, "inactive table already loaded")
+        }
+        aster_dm::DmError::DeviceBusy => Error::with_message(Errno::EBUSY, "device is busy"),
+        _ => Error::with_message(Errno::EINVAL, "failed to load table"),
+    })?;
 
     // Honor the read-only flag supplied with the table load.
     device.set_readonly(header.flags & DM_READONLY_FLAG != 0);

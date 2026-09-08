@@ -46,7 +46,9 @@ pub struct LinearTarget {
 
 /// Registers the `linear` target type and its version.
 pub fn register() {
-    crate::register_target_type("linear", [1, 0, 0]);
+    // Matches Linux's dm-linear version (changes are internal optimizations,
+    // no user-visible feature gating tied to the version number).
+    crate::register_target_type("linear", [1, 14, 0]);
 }
 
 impl LinearTarget {

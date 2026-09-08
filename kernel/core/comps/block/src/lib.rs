@@ -89,6 +89,20 @@ pub trait BlockDevice: Send + Sync + Any + Debug {
     fn partitions(&self) -> Option<Vec<Arc<dyn BlockDevice>>> {
         None
     }
+
+    /// Called when the block device file is opened by userspace.
+    ///
+    /// Devices may use this to maintain an open counter (e.g. for `dmsetup
+    /// info`) or to acquire resources. The default implementation is a no-op.
+    fn open(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Called when the last file descriptor referring to an open block device
+    /// file is released.
+    ///
+    /// The default implementation is a no-op.
+    fn close(&self) {}
 }
 
 /// Metadata for a block device.

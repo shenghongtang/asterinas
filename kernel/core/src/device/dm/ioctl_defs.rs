@@ -186,6 +186,18 @@ impl DmTargetSpec {
     }
 }
 
+/// A target message payload (8 bytes + variable-length message string).
+///
+/// Used by `DM_TARGET_MSG`. The `sector` field identifies the target region
+/// the message is addressed to; the null-terminated `message` string follows
+/// immediately after this struct in the ioctl data area.
+#[repr(C)]
+#[derive(Clone, Copy, Pod)]
+pub struct DmTargetMsg {
+    /// Logical sector identifying the target.
+    pub sector: u64,
+}
+
 /// Aligns a value up to the next multiple of 8.
 pub fn align8(len: usize) -> usize {
     (len + 7) & !7

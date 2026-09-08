@@ -24,7 +24,9 @@ pub struct ZeroTarget {
 
 /// Registers the `zero` target type and its version.
 pub fn register() {
-    crate::register_target_type("zero", [1, 0, 0]);
+    // Linux dm-zero 1.1.0 (discard support); discard is handled by the block
+    // layer which reports unsupported when the target does not implement it.
+    crate::register_target_type("zero", [1, 1, 0]);
 }
 
 impl ZeroTarget {

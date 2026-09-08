@@ -17,9 +17,13 @@ use core::fmt;
 
 use aster_block::{
     BLOCK_SIZE, BlockDevice, BlockDeviceLease, BlockDeviceMeta, SECTOR_SIZE,
-    bio::{BioEnqueueError, BioStatus, BioType, SubmittedBio},
+    bio::{
+        BioCompleteFn, BioDirection, BioEnqueueError, BioSegment, BioStatus, BioType, SubmittedBio,
+    },
+    id::Bid,
 };
 use device_id::DeviceId;
+use io_util::batch::IoBatch;
 use ostd::{mm::VmIo, sync::Mutex};
 
 use crate::{
@@ -103,21 +107,16 @@ pub struct VerityTarget {
     data_block_size: usize,
     /// Size of a hash block in bytes.
     hash_block_size: usize,
-    /// Reusable buffer for reading data blocks. Stored in the target instead of
-    /// the stack to avoid large stack frames on the I/O path. Sized at
-    /// construction to match the parsed data block size.
-    data_block: Mutex<Box<[u8]>>,
-    /// Reusable scratch buffer for reading hash blocks. Sized at construction
-    /// to match the parsed hash block size.
-    hash_scratch: Mutex<Box<[u8]>>,
-    /// Reusable digest output buffer. Sized at construction to match the
-    /// algorithm digest size so that `hash_block` performs no heap allocation.
-    digest_buf: Mutex<Box<[u8]>>,
+    /// Size of the algorithm digest in bytes.
+    digest_size: usize,
 }
 
 /// Registers the `verity` target type and its version.
 pub fn register() {
-    crate::register_target_type("verity", [1, 0, 0]);
+    // Linux dm-verity 1.3.0. Deliberately not 1.4.0, which introduced FEC
+    // (forward error correction) that is not implemented here; reporting
+    // 1.4.0 could lead userspace (cryptsetup) to request FEC and fail.
+    crate::register_target_type("verity", [1, 3, 0]);
 }
 
 impl VerityTarget {
@@ -259,9 +258,7 @@ impl VerityTarget {
             deps: [data_id, hash_id],
             data_block_size,
             hash_block_size,
-            data_block: Mutex::new(vec![0u8; data_block_size].into_boxed_slice()),
-            hash_scratch: Mutex::new(vec![0u8; hash_block_size].into_boxed_slice()),
-            digest_buf: Mutex::new(vec![0u8; digest_size].into_boxed_slice()),
+            digest_size,
         })
     }
 
@@ -422,9 +419,7 @@ impl VerityTarget {
             deps: [data_id, hash_id],
             data_block_size,
             hash_block_size,
-            data_block: Mutex::new(vec![0u8; data_block_size].into_boxed_slice()),
-            hash_scratch: Mutex::new(vec![0u8; hash_block_size].into_boxed_slice()),
-            digest_buf: Mutex::new(vec![0u8; digest_size].into_boxed_slice()),
+            digest_size,
         }
     }
 
@@ -438,139 +433,359 @@ impl VerityTarget {
         }
     }
 
-    /// Verifies `block` (at index `data_block_index`) against the hash tree,
-    /// returning whether every level up to the root digest matches.
-    fn verify_block(
-        &self,
-        data_block_index: u64,
-        block: &[u8],
-        hash_scratch: &mut [u8],
-        digest_buf: &mut [u8],
-    ) -> bool {
-        let digest_size = self.algorithm.digest_size();
-        let hashes_per_block = (self.hash_block_size / digest_size) as u64;
-        self.hash_block_into(block, digest_buf);
-        let mut child_index = data_block_index;
-
-        // Walk from the leaf level up to the root.
-        for level in self.levels.iter().rev() {
-            let block_in_level = child_index / hashes_per_block;
-            let slot = (child_index % hashes_per_block) as usize;
-            if block_in_level >= level.nr_blocks {
-                return false;
-            }
-
-            let Some(hash_block_index) = level.first_block.checked_add(block_in_level) else {
-                return false;
-            };
-            let Some(hash_block_offset) = hash_block_offset(hash_block_index, self.hash_block_size)
-            else {
-                return false;
-            };
-            if self
-                .hash_device
-                .read_bytes(hash_block_offset, hash_scratch)
-                .is_err()
-            {
-                return false;
-            }
-
-            let start = slot * digest_size;
-            let stored = &hash_scratch[start..start + digest_size];
-            if stored != &digest_buf[..digest_size] {
-                return false;
-            }
-
-            // Hash the whole block so the digest can be checked against the
-            // parent level. For the top level this produces the final root
-            // digest that is compared with the trusted value below.
-            self.hash_block_into(hash_scratch, digest_buf);
-            child_index = block_in_level;
+    /// Handles a read bio asynchronously.
+    ///
+    /// Ownership of the bio is transferred to a [`VerityReadCtx`] that drives
+    /// an asynchronous state machine: data blocks and hash-tree nodes are
+    /// read with `read_blocks_async`, and each completion advances the
+    /// machine until the bio is either verified and filled, or fails.
+    fn handle_read(self: Arc<Self>, bio: SubmittedBio, target_start_sector: u64) {
+        if let Some(ctx) = VerityReadCtx::new(self, bio, target_start_sector) {
+            ctx.start();
         }
-
-        // The hash of the top-level block must equal the trusted root digest.
-        digest_buf[..digest_size] == self.root_digest[..digest_size]
-    }
-
-    fn handle_read(&self, bio: SubmittedBio, target_start_sector: u64) {
-        // The verity unit of trust is a full data block, so verification always
-        // operates on whole blocks even when the request is sector-granular.
-        let Some(mut device_offset) = sector_offset(target_start_sector) else {
-            bio.complete(BioStatus::IoError);
-            return;
-        };
-
-        // Reusable target-level buffers avoid large stack allocations and
-        // per-read heap allocations. The per-block cache avoids re-reading
-        // the same block for small bios.
-        let mut data_block = self.data_block.lock();
-        let mut cached_block: Option<u64> = None;
-
-        for segment in bio.segments() {
-            let nbytes = segment.nbytes();
-            let mut segment_offset = 0;
-            while segment_offset < nbytes {
-                let block_index = (device_offset / self.data_block_size) as u64;
-                if block_index >= self.num_data_blocks {
-                    bio.complete(BioStatus::IoError);
-                    return;
-                }
-
-                if cached_block != Some(block_index) {
-                    let Some(block_offset) = data_block_offset(block_index, self.data_block_size)
-                    else {
-                        bio.complete(BioStatus::IoError);
-                        return;
-                    };
-                    if self
-                        .data_device
-                        .read_bytes(block_offset, &mut data_block)
-                        .is_err()
-                        || !{
-                            let mut hash_scratch = self.hash_scratch.lock();
-                            let mut digest_buf = self.digest_buf.lock();
-                            self.verify_block(
-                                block_index,
-                                &data_block,
-                                &mut hash_scratch,
-                                &mut digest_buf,
-                            )
-                        }
-                    {
-                        bio.complete(BioStatus::IoError);
-                        return;
-                    }
-                    cached_block = Some(block_index);
-                }
-
-                let within_block = device_offset % self.data_block_size;
-                let chunk = (self.data_block_size - within_block).min(nbytes - segment_offset);
-                if segment
-                    .inner_dma_slice()
-                    .write_bytes(
-                        segment_offset,
-                        &(*data_block)[within_block..within_block + chunk],
-                    )
-                    .is_err()
-                {
-                    bio.complete(BioStatus::IoError);
-                    return;
-                }
-
-                segment_offset += chunk;
-                let Some(next_device_offset) = device_offset.checked_add(chunk) else {
-                    bio.complete(BioStatus::IoError);
-                    return;
-                };
-                device_offset = next_device_offset;
-            }
-        }
-
-        bio.complete(BioStatus::Complete);
     }
 }
 
-impl Target for VerityTarget {
+/// Sentinel value for [`VerityReadInner::level_rev_idx`] meaning "the next
+/// read is a data block" rather than a hash-tree node.
+const PHASE_DATA: usize = usize::MAX;
+
+/// The action the state machine should take after processing a completion.
+#[derive(Clone, Copy)]
+enum NextAction {
+    /// Submit an asynchronous read for the next data block.
+    ReadData,
+    /// Submit an asynchronous read for the next hash-tree node.
+    ReadHash,
+    /// The bio has been fully verified and filled — complete successfully.
+    Done,
+    /// Verification or I/O failed — complete the bio with `IoError`.
+    Fail,
+}
+
+/// Per-bio state for an asynchronous dm-verity read.
+///
+/// All mutable per-read state (buffers, position counters, the bio itself)
+/// lives behind a single `Mutex`, while the immutable target configuration
+/// is shared via `Arc<VerityTarget>`. This replaces the previous design's
+/// target-global `Mutex<Box<[u8]>>` buffers, which serialized every read and
+/// performed all I/O synchronously on the caller's stack.
+struct VerityReadCtx {
+    target: Arc<VerityTarget>,
+    inner: Mutex<VerityReadInner>,
+}
+
+struct VerityReadInner {
+    /// The bio being serviced; taken out when it is completed.
+    bio: Option<SubmittedBio>,
+    /// A full data block, freshly read from the data device.
+    data_block: Box<[u8]>,
+    /// A full hash block, freshly read from the hash device.
+    hash_scratch: Box<[u8]>,
+    /// The running digest (hash of the most recently read data/hash block).
+    digest_buf: Box<[u8]>,
+    /// DMA segment used for data-block reads.
+    data_seg: BioSegment,
+    /// DMA segment used for hash-block reads.
+    hash_seg: BioSegment,
+    /// Index of the current bio segment being filled.
+    seg_idx: usize,
+    /// Byte offset within the current bio segment.
+    seg_offset: usize,
+    /// Byte offset into the data device for the next chunk.
+    device_offset: u64,
+    /// Index of the data block currently being verified.
+    block_index: u64,
+    /// Current hash-tree level counting from the leaf (`0` = leaf), or
+    /// [`PHASE_DATA`] when the next read is a data block.
+    level_rev_idx: usize,
+    /// Index (within the current level) of the node being verified.
+    child_index: u64,
+}
+
+impl VerityReadCtx {
+    /// Creates a new read context.
+    ///
+    /// Returns `None` (after completing the bio with `IoError`) if the
+    /// starting sector cannot be converted to a byte offset.
+    fn new(
+        target: Arc<VerityTarget>,
+        bio: SubmittedBio,
+        target_start_sector: u64,
+    ) -> Option<Arc<Self>> {
+        let Some(device_offset) = sector_offset(target_start_sector) else {
+            bio.complete(BioStatus::IoError);
+            return None;
+        };
+        let device_offset = device_offset as u64;
+
+        let digest_size = target.digest_size;
+        let data_block = vec![0u8; target.data_block_size].into_boxed_slice();
+        let hash_scratch = vec![0u8; target.hash_block_size].into_boxed_slice();
+        let digest_buf = vec![0u8; digest_size].into_boxed_slice();
+        let data_seg = BioSegment::alloc(
+            target.data_block_size / BLOCK_SIZE,
+            BioDirection::FromDevice,
+        );
+        let hash_seg = BioSegment::alloc(
+            target.hash_block_size / BLOCK_SIZE,
+            BioDirection::FromDevice,
+        );
+
+        let block_index = device_offset / target.data_block_size as u64;
+        Some(Arc::new(Self {
+            target,
+            inner: Mutex::new(VerityReadInner {
+                bio: Some(bio),
+                data_block,
+                hash_scratch,
+                digest_buf,
+                data_seg,
+                hash_seg,
+                seg_idx: 0,
+                seg_offset: 0,
+                device_offset,
+                block_index,
+                level_rev_idx: PHASE_DATA,
+                child_index: 0,
+            }),
+        }))
+    }
+
+    /// Kicks off the state machine by submitting the first data-block read.
+    fn start(self: Arc<Self>) {
+        if Self::submit_data_read(self.clone()).is_err() {
+            let mut inner = self.inner.lock();
+            if let Some(bio) = inner.bio.take() {
+                bio.complete(BioStatus::IoError);
+            }
+        }
+    }
+
+    /// Completion callback invoked after every data/hash block read.
+    fn on_read_complete(self: Arc<Self>, status: BioStatus) {
+        if status != BioStatus::Complete {
+            self.fail();
+            return;
+        }
+
+        let action = {
+            let mut inner = self.inner.lock();
+            self.process(&mut inner)
+        };
+
+        match action {
+            NextAction::ReadData => {
+                if Self::submit_data_read(self.clone()).is_err() {
+                    self.fail();
+                }
+            }
+            NextAction::ReadHash => {
+                if Self::submit_hash_read(self.clone()).is_err() {
+                    self.fail();
+                }
+            }
+            NextAction::Done => self.complete_bio(BioStatus::Complete),
+            NextAction::Fail => self.fail(),
+        }
+    }
+
+    /// Examines the current state (right after a read completed) and decides
+    /// the next action, updating buffers and counters as needed.
+    fn process(&self, inner: &mut VerityReadInner) -> NextAction {
+        let target = &*self.target;
+
+        if inner.level_rev_idx == PHASE_DATA {
+            // A data-block read just completed.
+            if inner.data_seg.inner_dma_slice().sync_from_device().is_err() {
+                return NextAction::Fail;
+            }
+            if inner.data_seg.read_bytes(0, &mut inner.data_block).is_err() {
+                return NextAction::Fail;
+            }
+
+            // Hash the data block to produce the leaf digest.
+            target.hash_block_into(&inner.data_block, &mut inner.digest_buf);
+            inner.child_index = inner.block_index;
+            inner.level_rev_idx = 0;
+            return NextAction::ReadHash;
+        }
+
+        // A hash-block read at level `level_rev_idx` just completed.
+        let Some(level) = target.levels.iter().rev().nth(inner.level_rev_idx) else {
+            return NextAction::Fail;
+        };
+        if inner.hash_seg.inner_dma_slice().sync_from_device().is_err() {
+            return NextAction::Fail;
+        }
+        if inner
+            .hash_seg
+            .read_bytes(0, &mut inner.hash_scratch)
+            .is_err()
+        {
+            return NextAction::Fail;
+        }
+
+        let digest_size = target.digest_size;
+        let hashes_per_block = (target.hash_block_size / digest_size) as u64;
+        let block_in_level = inner.child_index / hashes_per_block;
+        let slot = (inner.child_index % hashes_per_block) as usize;
+        if block_in_level >= level.nr_blocks {
+            return NextAction::Fail;
+        }
+        let start = slot * digest_size;
+        let stored = &inner.hash_scratch[start..start + digest_size];
+        if stored != &inner.digest_buf[..digest_size] {
+            return NextAction::Fail;
+        }
+
+        let next_level_rev = inner.level_rev_idx + 1;
+        if next_level_rev >= target.levels.len() {
+            // This was the root level — verify the root digest.
+            target.hash_block_into(&inner.hash_scratch, &mut inner.digest_buf);
+            if inner.digest_buf[..digest_size] != target.root_digest[..digest_size] {
+                return NextAction::Fail;
+            }
+            // Verification succeeded for this data block; copy it into the bio.
+            self.copy_data_to_bio(inner)
+        } else {
+            // Hash this hash block so the parent level can verify it.
+            target.hash_block_into(&inner.hash_scratch, &mut inner.digest_buf);
+            inner.child_index = block_in_level;
+            inner.level_rev_idx = next_level_rev;
+            NextAction::ReadHash
+        }
+    }
+
+    /// Copies the verified `data_block` into the bio's segments, advancing
+    /// the read position. Returns `Done` when the whole bio has been filled,
+    /// or `ReadData` when the next data block must be read.
+    fn copy_data_to_bio(&self, inner: &mut VerityReadInner) -> NextAction {
+        let target = &*self.target;
+        loop {
+            let Some(bio) = inner.bio.as_ref() else {
+                return NextAction::Fail;
+            };
+            if inner.seg_idx >= bio.segments().len() {
+                return NextAction::Done;
+            }
+            let segment = &bio.segments()[inner.seg_idx];
+            let nbytes = segment.nbytes();
+            if inner.seg_offset >= nbytes {
+                inner.seg_idx += 1;
+                inner.seg_offset = 0;
+                continue;
+            }
+
+            let within_block = (inner.device_offset as usize) % target.data_block_size;
+            let chunk = (target.data_block_size - within_block).min(nbytes - inner.seg_offset);
+            if segment
+                .inner_dma_slice()
+                .write_bytes(
+                    inner.seg_offset,
+                    &inner.data_block[within_block..within_block + chunk],
+                )
+                .is_err()
+            {
+                return NextAction::Fail;
+            }
+
+            inner.seg_offset += chunk;
+            let Some(next_device_offset) = inner.device_offset.checked_add(chunk as u64) else {
+                return NextAction::Fail;
+            };
+            inner.device_offset = next_device_offset;
+
+            // If we exhausted this data block, fetch the next one.
+            if within_block + chunk >= target.data_block_size {
+                inner.block_index += 1;
+                inner.level_rev_idx = PHASE_DATA;
+                return NextAction::ReadData;
+            }
+            // Otherwise the bio segment may still need more bytes from the
+            // same (already verified) data block — loop to copy them.
+        }
+    }
+
+    /// Submits an asynchronous read for the current data block.
+    ///
+    /// The submission happens outside the inner lock to avoid a deadlock if
+    /// the underlying device completes the bio synchronously.
+    fn submit_data_read(ctx: Arc<Self>) -> Result<(), BioEnqueueError> {
+        let (bid, seg) = {
+            let inner = ctx.inner.lock();
+            let target = &*ctx.target;
+            if inner.block_index >= target.num_data_blocks {
+                return Err(BioEnqueueError::Refused);
+            }
+            let Some(block_offset) = data_block_offset(inner.block_index, target.data_block_size)
+            else {
+                return Err(BioEnqueueError::Refused);
+            };
+            let bid = Bid::from_offset(block_offset);
+            let seg = inner.data_seg.clone();
+            (bid, seg)
+        };
+
+        let complete_ctx = ctx.clone();
+        let complete_fn: BioCompleteFn =
+            Box::new(move |status| Self::on_read_complete(complete_ctx, status));
+        let mut io_batch = IoBatch::new();
+        ctx.target
+            .data_device
+            .read_blocks_async(bid, seg, Some(complete_fn), &mut io_batch)
+    }
+
+    /// Submits an asynchronous read for the current hash-tree node.
+    fn submit_hash_read(ctx: Arc<Self>) -> Result<(), BioEnqueueError> {
+        let (bid, seg) = {
+            let inner = ctx.inner.lock();
+            let target = &*ctx.target;
+            let Some(level) = target.levels.iter().rev().nth(inner.level_rev_idx) else {
+                return Err(BioEnqueueError::Refused);
+            };
+            let hashes_per_block = (target.hash_block_size / target.digest_size) as u64;
+            let block_in_level = inner.child_index / hashes_per_block;
+            if block_in_level >= level.nr_blocks {
+                return Err(BioEnqueueError::Refused);
+            }
+            let Some(hash_block_index) = level.first_block.checked_add(block_in_level) else {
+                return Err(BioEnqueueError::Refused);
+            };
+            let Some(hash_block_offset) =
+                hash_block_offset(hash_block_index, target.hash_block_size)
+            else {
+                return Err(BioEnqueueError::Refused);
+            };
+            let bid = Bid::from_offset(hash_block_offset);
+            let seg = inner.hash_seg.clone();
+            (bid, seg)
+        };
+
+        let complete_ctx = ctx.clone();
+        let complete_fn: BioCompleteFn =
+            Box::new(move |status| Self::on_read_complete(complete_ctx, status));
+        let mut io_batch = IoBatch::new();
+        ctx.target
+            .hash_device
+            .read_blocks_async(bid, seg, Some(complete_fn), &mut io_batch)
+    }
+
+    /// Completes the bio with the given status, removing it from the state.
+    fn complete_bio(&self, status: BioStatus) {
+        let mut inner = self.inner.lock();
+        if let Some(bio) = inner.bio.take() {
+            bio.complete(status);
+        }
+    }
+
+    /// Completes the bio with `IoError`.
+    fn fail(&self) {
+        self.complete_bio(BioStatus::IoError);
+    }
+}
+
+impl Target for Arc<VerityTarget> {
     fn name(&self) -> &str {
         "verity"
     }
@@ -587,7 +802,13 @@ impl Target for VerityTarget {
         };
 
         match bio.type_() {
-            BioType::Read => self.handle_read(bio, target_start_sector),
+            // Reads are serviced by an asynchronous verification state machine.
+            // The target is held in an `Arc` so the per-read context keeps it
+            // alive while chained data/hash-block reads are in flight.
+            BioType::Read => {
+                let target = self.clone();
+                target.handle_read(bio, target_start_sector);
+            }
             // dm-verity is read-only; writes are rejected as I/O errors.
             BioType::Write => bio.complete(BioStatus::IoError),
             BioType::Flush => bio.complete(BioStatus::Complete),

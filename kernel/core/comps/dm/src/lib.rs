@@ -95,6 +95,7 @@ aster_cmdline::define_repeatable_kv_param!("dm_mod.create_mandatory", DM_CREATE_
 #[cfg(ktest)]
 mod test;
 
+pub use parser::parse_target;
 pub use table::{DmTable, TargetInfo};
 pub use target::{DmTarget, Target};
 pub use targets::{
@@ -227,6 +228,8 @@ pub enum TableError {
     Empty,
     /// A target covers zero sectors.
     ZeroLength,
+    /// The total sector count exceeds what fits in the platform `usize`.
+    TooLarge,
 }
 
 /// Errors that can occur when creating or managing device mapper devices.
@@ -546,7 +549,15 @@ impl MappedDevice {
             }
             self.bump_event_nr();
         } else {
-            // Resume: swap the inactive table to active if one was loaded.
+            // Resume: drain any in-flight I/O that may still be using the
+            // old active table (e.g. from a noflush suspend) before swapping
+            // in the inactive table. `drain` is safe here because the device
+            // is still suspended, so no new bios are admitted and the
+            // in-flight count is guaranteed to reach zero. This ensures no
+            // bio completes against a table that has been replaced.
+            self.io.drain();
+
+            // Swap the inactive table to active if one was loaded.
             // Lock order must be table -> inactive_table everywhere to avoid
             // deadlocks with reset(), table_states(), and update_dev_status().
             let mut active = self.table.lock();
@@ -686,6 +697,18 @@ impl MappedDevice {
         self.table.lock().clone()
     }
 
+    /// Routes a `DM_TARGET_MSG` to the target covering `sector` in the
+    /// active table.
+    ///
+    /// Returns `DmError::NotFound` if there is no active table or no target
+    /// covers the given sector.
+    pub fn target_message(&self, sector: u64, message: &str) -> Result<(), DmError> {
+        let table = self.table.lock();
+        let table = table.as_ref().ok_or(DmError::NotFound)?;
+        let target = table.find_target(sector).ok_or(DmError::NotFound)?;
+        target.message(sector, message)
+    }
+
     /// Returns a clone of the inactive table, if any.
     pub fn inactive_table(&self) -> Option<Arc<DmTable>> {
         self.inactive_table.lock().clone()
@@ -809,6 +832,15 @@ impl BlockDevice for MappedDevice {
 
     fn id(&self) -> DeviceId {
         self.id
+    }
+
+    fn open(&self) -> Result<(), aster_block::Error> {
+        self.open_count.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn close(&self) {
+        self.open_count.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

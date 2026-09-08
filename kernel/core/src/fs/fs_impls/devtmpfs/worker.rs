@@ -12,7 +12,7 @@ use crate::{prelude::*, thread::kernel_thread::ThreadOptions};
 ///
 /// The request is queued to the dedicated devtmpfs kernel thread and this
 /// function waits until the node has been created or the creation fails.
-pub(crate) fn create_node(node: DevtmpfsNode) -> Result<()> {
+pub(crate) fn create_node(node: DevtmpfsNode) -> Result<bool> {
     submit(Request::CreateNode(node))
 }
 
@@ -21,8 +21,9 @@ pub(crate) fn create_node(node: DevtmpfsNode) -> Result<()> {
 /// The request is queued to the dedicated devtmpfs kernel thread and this
 /// function waits until the deletion has completed or failed. The deletion only
 /// unlinks nodes that were created by `devtmpfsd` and still match the requested
-/// device type and device ID.
-pub(crate) fn delete_node(node: DevtmpfsNode) -> Result<()> {
+/// device type and device ID. Returns `Ok(true)` if the node was removed,
+/// `Ok(false)` if the node exists but belongs to a different device.
+pub(crate) fn delete_node(node: DevtmpfsNode) -> Result<bool> {
     submit(Request::DeleteNode(node))
 }
 
@@ -30,7 +31,7 @@ pub(super) fn init_in_first_kthread() {
     ThreadOptions::new(devtmpfsd).spawn();
 }
 
-fn submit(request: Request) -> Result<()> {
+fn submit(request: Request) -> Result<bool> {
     let (waiter, waker) = Waiter::new_pair();
     let request = Arc::new(PendingRequest::new(request, waker));
 
@@ -60,7 +61,7 @@ fn devtmpfsd() {
         };
 
         let result = match &request.request {
-            Request::CreateNode(node) => tree::create_node(node),
+            Request::CreateNode(node) => tree::create_node(node).map(|()| true),
             Request::DeleteNode(node) => tree::delete_node(node),
         };
         request.result.call_once(|| result);
@@ -80,7 +81,7 @@ static REQUEST_QUEUE: RequestQueue = RequestQueue {
 
 struct PendingRequest {
     request: Request,
-    result: Once<Result<()>>,
+    result: Once<Result<bool>>,
     waker: Arc<Waker>,
 }
 

@@ -1,11 +1,22 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Parser for the `dm_mod.create=` and `dm_mod.create_mandatory=` kernel
-//! command-line parameters.
+//! Parsing for device-mapper table specifications.
 //!
-//! Mirrors Linux's `dm-mod.create=` syntax, allowing device-mapper devices to
-//! be created at boot time without userspace involvement. Each value has the
-//! form:
+//! This module provides the **single source of truth** for parsing target
+//! parameters. It is shared by two entry points:
+//!
+//! 1. Boot-time: the `dm_mod.create=` / `dm_mod.create_mandatory=` kernel
+//!    command-line parameters (see [`parse_create_arg`] and
+//!    [`create_boot_devices`]);
+//! 2. Runtime: the `DM_TABLE_LOAD` ioctl, which calls [`parse_target`] after
+//!    splitting the `DmTargetSpec` parameter string.
+//!
+//! Keeping both paths behind the same parsing logic guarantees that
+//! validation rules (e.g. striped `stripe_size` being a power of two, the
+//! mapping staying within the underlying device) cannot drift between the
+//! boot and runtime paths.
+//!
+//! The boot syntax mirrors Linux's `dm-mod.create=`:
 //!
 //! ```text
 //! "<name>: <start_sector> <length> <target_type> <target_args>[; ...]"
@@ -25,8 +36,8 @@
 //! where continuing without the device would lead to an unusable system.
 
 use alloc::{
-    boxed::Box,
     string::{String, ToString},
+    sync::Arc,
     vec::Vec,
 };
 use core::str::FromStr;
@@ -130,89 +141,26 @@ fn split_name_and_table(arg: &str) -> Option<(&str, &str)> {
     Some(("-", arg))
 }
 
-/// Parses one table segment line:
-/// `<start_sector> <length> <target_type> [target_args...]`
-fn parse_segment(line: &str) -> Result<(u64, u64, DmTarget), DmError> {
-    let mut fields = line.split_whitespace();
-    let start_sector = parse_u64(fields.next(), "segment start sector")?;
-    let len_sectors = parse_u64(fields.next(), "segment length")?;
-    let target_name = fields
-        .next()
-        .ok_or(DmError::InvalidParameters("missing target type"))?;
-    let args: Vec<&str> = fields.collect();
-
-    let target: DmTarget = match target_name {
-        "linear" => DmTarget::Linear(parse_linear_target(&args, len_sectors)?),
-        "striped" => {
-            // LVM uses "striped" even for single-stripe (linear) LVs.
-            // Format: "<num_stripes> <stripe_size> <dev1> <start1> [<dev2> <start2> ...]"
-            // A single-stripe striped target is equivalent to linear; multi-stripe
-            // targets distribute I/O across the underlying devices (RAID0).
-            if args.len() < 4 {
-                return Err(DmError::InvalidParameters(
-                    "striped target requires at least <num_stripes> <stripe_size> <dev> <start>",
-                ));
-            }
-            let num_stripes: usize = args[0]
-                .parse()
-                .map_err(|_| DmError::InvalidParameters("invalid stripe count"))?;
-            if num_stripes == 0 {
-                return Err(DmError::InvalidParameters("stripe count must be non-zero"));
-            }
-            let stripe_size = parse_u64(Some(args[1]), "striped stripe size")?;
-            if stripe_size == 0 {
-                return Err(DmError::InvalidParameters("stripe size must be non-zero"));
-            }
-            if stripe_size.count_ones() != 1 {
-                return Err(DmError::InvalidParameters(
-                    "stripe size must be a power of two",
-                ));
-            }
-            if args.len() != 2 + 2 * num_stripes {
-                return Err(DmError::InvalidParameters(
-                    "striped target has mismatched device/start pair count",
-                ));
-            }
-            let mut stripes = Vec::new();
-            let mut idx = 2;
-            for _ in 0..num_stripes {
-                let dev = crate::lookup_block_device(args[idx])?;
-                let start = parse_u64(Some(args[idx + 1]), "striped start sector")?;
-                stripes.push((dev, start));
-                idx += 2;
-            }
-
-            // Validate that every stripe device is large enough for the mapped
-            // region. With RAID0 wrap-around, absolute stripe `a` lands on
-            // physical device `a % num_stripes` at round `a / num_stripes`.
-            let num_abs_stripes = len_sectors.div_ceil(stripe_size);
-            for (i, (dev, start)) in stripes.iter().enumerate() {
-                let count =
-                    (num_abs_stripes + num_stripes as u64 - 1 - i as u64) / num_stripes as u64;
-                if count == 0 {
-                    continue;
-                }
-                let a_last = i as u64 + (count - 1) * num_stripes as u64;
-                let last_stripe_sectors = if a_last == num_abs_stripes - 1 {
-                    len_sectors - a_last * stripe_size
-                } else {
-                    stripe_size
-                };
-                let end_sector = start
-                    .checked_add((count - 1) * stripe_size)
-                    .and_then(|s| s.checked_add(last_stripe_sectors))
-                    .ok_or(DmError::InvalidParameters(
-                        "striped target extends past the end of an underlying device",
-                    ))?;
-                if end_sector > dev.metadata().nr_sectors as u64 {
-                    return Err(DmError::InvalidParameters(
-                        "striped target extends past the end of an underlying device",
-                    ));
-                }
-            }
-
-            DmTarget::Striped(StripedTarget::new(stripes, stripe_size))
-        }
+/// Parses a single target specification into a [`DmTarget`].
+///
+/// `target_type` is the target type name (e.g. `"linear"`, `"verity"`),
+/// `args` is the whitespace-split list of target-specific arguments, and
+/// `len_sectors` is the length of the table segment this target maps.
+///
+/// This is the single entry point for target parameter parsing, shared by
+/// both the boot-time (`dm_mod.create=`) and ioctl (`DM_TABLE_LOAD`) paths so
+/// that validation rules (stripe size being a power of two, mappings staying
+/// within the underlying device, etc.) cannot drift between them.
+///
+/// Supported target types: `linear`, `striped`, `zero`, `error`, `verity`.
+pub fn parse_target(
+    target_type: &str,
+    args: &[&str],
+    len_sectors: u64,
+) -> Result<DmTarget, DmError> {
+    let target = match target_type {
+        "linear" => DmTarget::Linear(parse_linear_target(args, len_sectors)?),
+        "striped" => DmTarget::Striped(parse_striped_target(args, len_sectors)?),
         "zero" => {
             if !args.is_empty() {
                 return Err(DmError::InvalidParameters(
@@ -229,10 +177,24 @@ fn parse_segment(line: &str) -> Result<(u64, u64, DmTarget), DmError> {
             }
             DmTarget::Error(ErrorTarget::new(len_sectors))
         }
-        "verity" => DmTarget::Verity(Box::new(parse_verity_target(&args)?)),
+        "verity" => DmTarget::Verity(Arc::new(parse_verity_target(args)?)),
         _ => return Err(DmError::InvalidParameters("unsupported target type")),
     };
+    Ok(target)
+}
 
+/// Parses one table segment line:
+/// `<start_sector> <length> <target_type> [target_args...]`
+fn parse_segment(line: &str) -> Result<(u64, u64, DmTarget), DmError> {
+    let mut fields = line.split_whitespace();
+    let start_sector = parse_u64(fields.next(), "segment start sector")?;
+    let len_sectors = parse_u64(fields.next(), "segment length")?;
+    let target_name = fields
+        .next()
+        .ok_or(DmError::InvalidParameters("missing target type"))?;
+    let args: Vec<&str> = fields.collect();
+
+    let target = parse_target(target_name, &args, len_sectors)?;
     Ok((start_sector, len_sectors, target))
 }
 
@@ -255,6 +217,78 @@ fn parse_linear_target(args: &[&str], len_sectors: u64) -> Result<LinearTarget, 
         ));
     }
     Ok(LinearTarget::new(device, start_sector))
+}
+
+fn parse_striped_target(args: &[&str], len_sectors: u64) -> Result<StripedTarget, DmError> {
+    // LVM uses "striped" even for single-stripe (linear) LVs.
+    // Format: "<num_stripes> <stripe_size> <dev1> <start1> [<dev2> <start2> ...]"
+    // A single-stripe striped target is equivalent to linear; multi-stripe
+    // targets distribute I/O across the underlying devices (RAID0).
+    if args.len() < 4 {
+        return Err(DmError::InvalidParameters(
+            "striped target requires at least <num_stripes> <stripe_size> <dev> <start>",
+        ));
+    }
+    let num_stripes: usize = args[0]
+        .parse()
+        .map_err(|_| DmError::InvalidParameters("invalid stripe count"))?;
+    if num_stripes == 0 {
+        return Err(DmError::InvalidParameters("stripe count must be non-zero"));
+    }
+    let stripe_size = parse_u64(Some(args[1]), "striped stripe size")?;
+    if stripe_size == 0 {
+        return Err(DmError::InvalidParameters(
+            "striped stripe size must be non-zero",
+        ));
+    }
+    if stripe_size.count_ones() != 1 {
+        return Err(DmError::InvalidParameters(
+            "stripe size must be a power of two",
+        ));
+    }
+    if args.len() != 2 + 2 * num_stripes {
+        return Err(DmError::InvalidParameters(
+            "striped target has mismatched device/start pair count",
+        ));
+    }
+    let mut stripes = Vec::new();
+    let mut idx = 2;
+    for _ in 0..num_stripes {
+        let dev = crate::lookup_block_device(args[idx])?;
+        let start = parse_u64(Some(args[idx + 1]), "striped start sector")?;
+        stripes.push((dev, start));
+        idx += 2;
+    }
+
+    // Validate that every stripe device is large enough for the mapped
+    // region. With RAID0 wrap-around, absolute stripe `a` lands on
+    // physical device `a % num_stripes` at round `a / num_stripes`.
+    let num_abs_stripes = len_sectors.div_ceil(stripe_size);
+    for (i, (dev, start)) in stripes.iter().enumerate() {
+        let count = (num_abs_stripes + num_stripes as u64 - 1 - i as u64) / num_stripes as u64;
+        if count == 0 {
+            continue;
+        }
+        let a_last = i as u64 + (count - 1) * num_stripes as u64;
+        let last_stripe_sectors = if a_last == num_abs_stripes - 1 {
+            len_sectors - a_last * stripe_size
+        } else {
+            stripe_size
+        };
+        let end_sector = start
+            .checked_add((count - 1) * stripe_size)
+            .and_then(|s| s.checked_add(last_stripe_sectors))
+            .ok_or(DmError::InvalidParameters(
+                "striped target extends past the end of an underlying device",
+            ))?;
+        if end_sector > dev.metadata().nr_sectors as u64 {
+            return Err(DmError::InvalidParameters(
+                "striped target extends past the end of an underlying device",
+            ));
+        }
+    }
+
+    Ok(StripedTarget::new(stripes, stripe_size))
 }
 
 fn parse_verity_target(args: &[&str]) -> Result<VerityTarget, DmError> {

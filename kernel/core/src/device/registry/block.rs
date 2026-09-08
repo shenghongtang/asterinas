@@ -64,7 +64,8 @@ pub(super) fn init_in_first_process() -> Result<()> {
     for device in aster_block::collect_all() {
         let device: Arc<dyn Device> = Arc::new(BlockFile::new(device));
         if let Some(meta) = device.devtmpfs_meta() {
-            devtmpfs::create_node(DevtmpfsNode::new(device.type_(), device.id(), meta))?;
+            devtmpfs::create_node(DevtmpfsNode::new(device.type_(), device.id(), meta))
+                .map(|_| ())?;
         }
     }
 
@@ -139,6 +140,10 @@ impl Device for BlockFile {
     }
 
     fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
+        self.0.open().map_err(|e| match e {
+            aster_block::Error::Busy => Error::with_message(Errno::EBUSY, "block device is busy"),
+            _ => Error::with_message(Errno::EIO, "failed to open block device"),
+        })?;
         Ok(Box::new(OpenBlockFile(self.0.clone())))
     }
 }
@@ -149,6 +154,12 @@ impl Device for BlockFile {
 // `PerOpenFileOps` trait. It leads to redundant vtable dispatch and heap allocation. We should
 // devise a better strategy to eliminate the unnecessary intermediate `Box`.
 struct OpenBlockFile(Arc<dyn BlockDevice>);
+
+impl Drop for OpenBlockFile {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
 
 impl FileOps for OpenBlockFile {
     fn read_at(

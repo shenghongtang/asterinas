@@ -24,6 +24,7 @@ use aster_block::{
 use device_id::DeviceId;
 use io_util::batch::IoBatch;
 use ostd::sync::{LocalIrqDisabled, SpinLock};
+use smallvec::SmallVec;
 
 use crate::{
     TableError,
@@ -117,7 +118,8 @@ impl DmTable {
             .metadata
             .max_nr_segments_per_bio
             .min(target_metadata.max_nr_segments_per_bio);
-        self.metadata.nr_sectors = self.total_sectors as usize;
+        self.metadata.nr_sectors =
+            usize::try_from(self.total_sectors).map_err(|_| TableError::TooLarge)?;
 
         // Collect unique underlying devices now so map_flush does not have to
         // recompute this set on every flush request.
@@ -143,6 +145,18 @@ impl DmTable {
     /// Returns the number of targets in the table.
     pub fn num_targets(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Returns the target whose region contains `sector`, if any.
+    ///
+    /// Used by `DM_TARGET_MSG` to route a message to the correct target.
+    /// `sector` is compared against each entry's
+    /// `[logical_start, logical_start + num_sectors)` range.
+    pub fn find_target(&self, sector: u64) -> Option<&DmTarget> {
+        self.entries
+            .iter()
+            .find(|e| sector >= e.logical_start && sector < e.logical_start + e.num_sectors)
+            .map(|e| &e.target)
     }
 
     /// Maps a submitted bio to the appropriate target and forwards it.
@@ -204,8 +218,9 @@ impl DmTable {
         }
 
         // The bio spans multiple targets - split it at the boundaries.
-        let ranges: Vec<Range<Sid>> = parts.iter().map(|(range, _)| range.clone()).collect();
-        let (children, completion) = bio.split(ranges)?;
+        let ranges: SmallVec<[Range<Sid>; 4]> =
+            parts.iter().map(|(range, _)| range.clone()).collect();
+        let (children, completion) = bio.split(&ranges)?;
 
         for (child, (_range, entry)) in children.into_iter().zip(parts) {
             if entry.target.map_bio(child, entry.logical_start).is_err() {
@@ -226,9 +241,9 @@ impl DmTable {
         &self,
         start: u64,
         end: u64,
-    ) -> Result<Vec<(Range<Sid>, &TableEntry)>, BioEnqueueError> {
+    ) -> Result<SmallVec<[(Range<Sid>, &TableEntry); 4]>, BioEnqueueError> {
         let mut cursor = start;
-        let mut parts = Vec::new();
+        let mut parts = SmallVec::new();
         while cursor < end {
             let idx = self.entries.partition_point(|e| e.logical_start <= cursor);
             let entry = idx

@@ -16,7 +16,7 @@
 //! `drivers/md/dm-stripe.c`.
 
 use alloc::{format, string::String, sync::Arc, vec::Vec};
-use core::fmt;
+use core::{fmt, ops::Range};
 
 use aster_block::{
     BlockDevice, BlockDeviceLease, BlockDeviceMeta,
@@ -24,6 +24,7 @@ use aster_block::{
     id::Sid,
 };
 use device_id::DeviceId;
+use smallvec::SmallVec;
 
 use crate::target::Target;
 
@@ -61,21 +62,29 @@ pub struct StripedTarget {
 
 /// Registers the `striped` target type and its version.
 pub fn register() {
-    crate::register_target_type("striped", [1, 0, 0]);
+    // Linux dm-stripe 1.6.0; basic multi-stripe (RAID0) is implemented.
+    crate::register_target_type("striped", [1, 6, 0]);
 }
 
 impl StripedTarget {
     /// Creates a new striped target.
     ///
     /// `stripes` is a list of `(device, start_sector)` pairs, one per stripe.
-    /// `stripe_size` is the width of each stripe in sectors and must be
-    /// non-zero. Linux additionally requires it to be a power of two.
+    /// `stripe_size` is the width of each stripe in sectors and must be a
+    /// non-zero power of two (Linux `dm-stripe` requirement). Callers that
+    /// accept untrusted input must validate it before calling this constructor
+    /// (the shared target parser does so); direct callers passing an invalid
+    /// `stripe_size` will panic.
     pub fn new(stripes: Vec<(Arc<dyn BlockDevice>, u64)>, stripe_size: u64) -> Self {
         assert!(
             !stripes.is_empty(),
             "striped target requires at least one stripe"
         );
         assert!(stripe_size > 0, "stripe size must be non-zero");
+        assert!(
+            stripe_size.is_power_of_two(),
+            "stripe size must be a power of two"
+        );
 
         let stripes: Vec<Stripe> = stripes
             .into_iter()
@@ -206,7 +215,7 @@ impl Target for StripedTarget {
 
         // The bio spans multiple absolute stripes - split at every stripe
         // boundary and forward each child to its (possibly different) device.
-        let mut ranges = Vec::new();
+        let mut ranges = SmallVec::<[Range<Sid>; 8]>::new();
         let mut cursor = cur_start;
         let mut a = first_abs;
         while a <= last_abs {
@@ -217,7 +226,7 @@ impl Target for StripedTarget {
             a += 1;
         }
 
-        let (children, completion) = bio.split(ranges)?;
+        let (children, completion) = bio.split(&ranges)?;
         // Zip children with the absolute stripe range directly to avoid building
         // a second temporary Vec.
         for (mut child, abs) in children.into_iter().zip(first_abs..=last_abs) {

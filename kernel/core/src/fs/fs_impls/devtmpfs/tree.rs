@@ -106,15 +106,22 @@ pub(super) fn create_node(node: &DevtmpfsNode) -> Result<()> {
     create_device_node(parent_inode.as_ref(), node_name, node)
 }
 
-pub(super) fn delete_node(node: &DevtmpfsNode) -> Result<()> {
+/// Deletes a device node, but only if it still matches the requested device
+/// type and device ID (revalidation).
+///
+/// Returns `Ok(true)` if the node was removed, `Ok(false)` if the node exists
+/// but belongs to a different device (dev-id mismatch), and `Err` if the
+/// parent path lookup or unlink fails.
+pub(super) fn delete_node(node: &DevtmpfsNode) -> Result<bool> {
     let (parent_path, node_name) = node.meta.path().split_dirname_and_basename().unwrap();
     let parent_inode = lookup_path(parent_path)?;
     let parent_ram_inode = parent_inode.downcast_ref::<RamInode>().unwrap();
 
-    if parent_ram_inode.unlink_if(node_name, |inode| matches_device(inode, node))? {
+    let removed = parent_ram_inode.unlink_if(node_name, |inode| matches_device(inode, node))?;
+    if removed {
         remove_empty_parent_dirs(parent_path);
     }
-    Ok(())
+    Ok(removed)
 }
 
 pub(super) fn lookup_path(path: &str) -> Result<Arc<dyn Inode>> {

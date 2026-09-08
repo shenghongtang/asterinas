@@ -8,7 +8,7 @@
 //! contiguous logical range to a contiguous physical range on a single
 //! underlying device.
 
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 
 use aster_block::{
     BlockDevice, BlockDeviceMeta,
@@ -16,9 +16,12 @@ use aster_block::{
 };
 use device_id::DeviceId;
 
-use crate::targets::{
-    error::ErrorTarget, linear::LinearTarget, striped::StripedTarget, verity::VerityTarget,
-    zero::ZeroTarget,
+use crate::{
+    DmError,
+    targets::{
+        error::ErrorTarget, linear::LinearTarget, striped::StripedTarget, verity::VerityTarget,
+        zero::ZeroTarget,
+    },
 };
 
 /// A device mapper target.
@@ -72,6 +75,20 @@ pub trait Target: Send + Sync + core::fmt::Debug {
     /// handles so the table can issue flushes directly without requiring a
     /// fresh registry lookup.
     fn underlying_devices(&self) -> Vec<Arc<dyn BlockDevice>>;
+
+    /// Handles a `DM_TARGET_MSG` request sent to this target.
+    ///
+    /// `sector` identifies the target region the message is addressed to
+    /// (callers pass the start sector of the target). `message` is the
+    /// null-terminated message string from userspace.
+    ///
+    /// The default implementation returns
+    /// [`DmError::InvalidParameters`] with a generic "not supported" message.
+    /// Targets that support messages (e.g. `verity`'s `create_device`) should
+    /// override this.
+    fn message(&self, _sector: u64, _message: &str) -> Result<(), DmError> {
+        Err(DmError::InvalidParameters("target message not supported"))
+    }
 }
 
 /// An enum wrapper around all built-in device mapper target implementations.
@@ -87,8 +104,9 @@ pub enum DmTarget {
     Striped(StripedTarget),
     /// A verity integrity-verification target.
     ///
-    /// Boxed because `VerityTarget` is much larger than the other variants.
-    Verity(Box<VerityTarget>),
+    /// Held in an `Arc` so that per-bio async verification state can keep the
+    /// target alive while chained data/hash-block reads are in flight.
+    Verity(Arc<VerityTarget>),
     /// A target that returns zeroes.
     Zero(ZeroTarget),
     /// A target that always returns I/O errors.
@@ -153,6 +171,16 @@ impl Target for DmTarget {
             DmTarget::Verity(t) => t.underlying_devices(),
             DmTarget::Zero(t) => t.underlying_devices(),
             DmTarget::Error(t) => t.underlying_devices(),
+        }
+    }
+
+    fn message(&self, sector: u64, message: &str) -> Result<(), DmError> {
+        match self {
+            DmTarget::Linear(t) => t.message(sector, message),
+            DmTarget::Striped(t) => t.message(sector, message),
+            DmTarget::Verity(t) => t.message(sector, message),
+            DmTarget::Zero(t) => t.message(sector, message),
+            DmTarget::Error(t) => t.message(sector, message),
         }
     }
 }

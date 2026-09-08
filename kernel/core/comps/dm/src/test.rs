@@ -797,7 +797,7 @@ fn build_verity_mapped_with_sizes(
     let size_sectors = (data_block_size / SECTOR_SIZE) as u64;
     let mut table = DmTable::new();
     table
-        .add_target(0, size_sectors, DmTarget::Verity(Box::new(target)))
+        .add_target(0, size_sectors, DmTarget::Verity(Arc::new(target)))
         .unwrap();
     MappedDevice::create(name, table).unwrap()
 }
@@ -830,7 +830,7 @@ fn build_verity_mapped(
     let size_sectors = (BLOCK_SIZE / SECTOR_SIZE) as u64;
     let mut table = DmTable::new();
     table
-        .add_target(0, size_sectors, DmTarget::Verity(Box::new(target)))
+        .add_target(0, size_sectors, DmTarget::Verity(Arc::new(target)))
         .unwrap();
     MappedDevice::create(name, table).unwrap()
 }
@@ -856,7 +856,7 @@ fn build_verity_mapped_sha512(
     let size_sectors = (BLOCK_SIZE / SECTOR_SIZE) as u64;
     let mut table = DmTable::new();
     table
-        .add_target(0, size_sectors, DmTarget::Verity(Box::new(target)))
+        .add_target(0, size_sectors, DmTarget::Verity(Arc::new(target)))
         .unwrap();
     MappedDevice::create(name, table).unwrap()
 }
@@ -984,7 +984,7 @@ fn build_verity_mapped_multi(
     let size_sectors = ((num_data_blocks * BLOCK_SIZE) / SECTOR_SIZE) as u64;
     let mut table = DmTable::new();
     table
-        .add_target(0, size_sectors, DmTarget::Verity(Box::new(target)))
+        .add_target(0, size_sectors, DmTarget::Verity(Arc::new(target)))
         .unwrap();
     MappedDevice::create(name, table).unwrap()
 }
@@ -2235,7 +2235,7 @@ fn verity_from_table_args_parses_valid_table() {
     let size_sectors = ((num_blocks * BLOCK_SIZE) / SECTOR_SIZE) as u64;
     let mut table = DmTable::new();
     table
-        .add_target(0, size_sectors, DmTarget::Verity(Box::new(target)))
+        .add_target(0, size_sectors, DmTarget::Verity(Arc::new(target)))
         .unwrap();
     let mapped = MappedDevice::create("dm-vt-args", table).unwrap();
     let segment = BioSegment::alloc(1, BioDirection::FromDevice);
@@ -2264,7 +2264,7 @@ fn verity_from_table_args_version_zero_hash_order() {
         let size_sectors = ((num_blocks * BLOCK_SIZE) / SECTOR_SIZE) as u64;
         let mut table = DmTable::new();
         table
-            .add_target(0, size_sectors, DmTarget::Verity(Box::new(target)))
+            .add_target(0, size_sectors, DmTarget::Verity(Arc::new(target)))
             .unwrap();
         let mapped = MappedDevice::create(name, table).unwrap();
         let segment = BioSegment::alloc(1, BioDirection::FromDevice);
@@ -2874,7 +2874,7 @@ fn verity_read_beyond_data_blocks_fails() {
     // The table claims two blocks although the target only covers one.
     let mut table = DmTable::new();
     table
-        .add_target(0, 16, DmTarget::Verity(Box::new(target)))
+        .add_target(0, 16, DmTarget::Verity(Arc::new(target)))
         .unwrap();
     let mapped = MappedDevice::create("dm-vt-oob", table).unwrap();
 

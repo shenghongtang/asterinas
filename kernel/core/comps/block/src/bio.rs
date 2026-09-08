@@ -280,9 +280,9 @@ impl SubmittedBio {
     /// bio is completed with the aggregate status.
     pub fn split(
         self,
-        ranges: Vec<Range<Sid>>,
+        ranges: &[Range<Sid>],
     ) -> Result<(Vec<Self>, SplitBioCompletionHandle), BioEnqueueError> {
-        self.validate_split_ranges(&ranges)?;
+        self.validate_split_ranges(ranges)?;
 
         let type_ = self.type_();
         let parent_offset = self.sid_offset;
@@ -297,7 +297,7 @@ impl SubmittedBio {
         });
 
         let children = ranges
-            .into_iter()
+            .iter()
             .zip(child_segments)
             .map(|(range, segments)| {
                 let completion = completion.clone();

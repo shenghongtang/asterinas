@@ -26,7 +26,8 @@ pub struct ErrorTarget {
 
 /// Registers the `error` target type and its version.
 pub fn register() {
-    crate::register_target_type("error", [1, 0, 0]);
+    // Matches Linux's dm-error version (internal changes only).
+    crate::register_target_type("error", [1, 5, 0]);
 }
 
 impl ErrorTarget {

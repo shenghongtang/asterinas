@@ -208,6 +208,7 @@ dependencies = [
  "id-alloc",
  "io-util",
  "ostd",
+ "smallvec",
  "spin",
 ]
 
