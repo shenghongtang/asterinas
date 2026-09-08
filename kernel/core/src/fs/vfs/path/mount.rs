@@ -2,6 +2,7 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use aster_block::BlockDevice;
 use atomic_integer_wrapper::define_atomic_version_of_integer_like_type;
 use hashbrown::HashMap;
 use ostd::sync::{RwMutexReadGuard, RwMutexWriteGuard};
@@ -251,6 +252,12 @@ pub(crate) struct Mount {
     mountpoint: RwLock<Option<Arc<Dentry>>>,
     /// The associated mounted filesystem.
     fs: Arc<dyn FileSystem>,
+    /// The block device opened for this mount, if any.
+    ///
+    /// When the `Mount` is dropped (umount), `close()` is called on the
+    /// device, decrementing the open count so that `DM_DEV_REMOVE` can
+    /// proceed after the last mount is gone.
+    block_device: Option<Arc<dyn BlockDevice>>,
     /// The mount source (e.g., a device path like "/dev/vda" or a filesystem name like "proc").
     ///
     /// The source is stored in `Mount` instead of requiring each filesystem to provide it.
@@ -289,7 +296,7 @@ impl Mount {
     ) -> Result<Arc<Self>> {
         let source = fs.name().to_string();
         let root_dentry = Dentry::new_root(fs.root_inode());
-        Self::new(root_dentry, fs, flags, None, mnt_ns, Some(source))
+        Self::new(root_dentry, fs, flags, None, mnt_ns, Some(source), None)
     }
 
     /// Creates a pseudo mount node with an associated FS.
@@ -304,6 +311,7 @@ impl Mount {
             PerMountFlags::KERNMOUNT,
             None,
             Weak::new(),
+            None,
             None,
         )
     }
@@ -321,8 +329,8 @@ impl Mount {
         mnt_ns: Weak<MountNamespace>,
         source: Option<String>,
     ) -> Result<Arc<Self>> {
-        let (fs, root_dentry) = fs_and_root.into_parts();
-        Self::new(root_dentry, fs, flags, None, mnt_ns, source)
+        let (fs, root_dentry, block_device) = fs_and_root.into_parts();
+        Self::new(root_dentry, fs, flags, None, mnt_ns, source, block_device)
     }
 
     /// The internal constructor.
@@ -340,6 +348,7 @@ impl Mount {
         parent_mount: Option<Weak<Mount>>,
         mnt_ns: Weak<MountNamespace>,
         source: Option<String>,
+        block_device: Option<Arc<dyn BlockDevice>>,
     ) -> Result<Arc<Self>> {
         let id = MountId::alloc()
             .ok_or_else(|| Error::with_message(Errno::ENOMEM, "mount ID space exhausted"))?;
@@ -349,6 +358,7 @@ impl Mount {
             root_dentry,
             mountpoint: RwLock::new(None),
             fs,
+            block_device,
             source,
             parent: RwLock::new(parent_mount),
             children: RwLock::new(HashMap::new()),
@@ -411,7 +421,7 @@ impl Mount {
         }
 
         let key = mountpoint.key();
-        let (fs, root_dentry) = fs_and_root.into_parts();
+        let (fs, root_dentry, block_device) = fs_and_root.into_parts();
         let child_mount = Self::new(
             root_dentry,
             fs,
@@ -419,6 +429,7 @@ impl Mount {
             Some(Arc::downgrade(self)),
             self.mnt_ns.clone(),
             source,
+            block_device,
         )?;
         self.children.write().insert(key, child_mount.clone());
         child_mount.set_mountpoint(mountpoint);
@@ -464,6 +475,7 @@ impl Mount {
             root_dentry: root_dentry.clone(),
             mountpoint: RwLock::new(None),
             fs: self.fs.clone(),
+            block_device: None,
             source: self.source.clone(),
             parent: RwLock::new(None),
             children: RwLock::new(HashMap::new()),
@@ -776,6 +788,12 @@ impl Drop for Mount {
         // will be freed in a moment).
         if let Some(ns) = self.mnt_ns.upgrade() {
             ns.deregister_mount(self.id.unique_id());
+        }
+        // Release the block device open reference acquired at mount time.
+        // This decrements the device's open count, allowing `DM_DEV_REMOVE`
+        // to proceed once all mounts are gone.
+        if let Some(block_device) = &self.block_device {
+            block_device.close();
         }
         // The recyclable ID is returned to the pool by `MountId`'s `Drop`.
     }

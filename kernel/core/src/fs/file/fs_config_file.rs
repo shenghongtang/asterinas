@@ -167,7 +167,10 @@ impl FsConfigFile {
             let args = (!config.extra_options.is_empty()).then_some(config.extra_options.as_str());
             let mut fs_creation_ctx =
                 FsCreationCtx::new(config.source.as_deref(), config.flags, args, ctx);
-            let fs_and_root = self.fs_type.get_or_create(&mut fs_creation_ctx)?;
+            let mut fs_and_root = self.fs_type.get_or_create(&mut fs_creation_ctx)?;
+            if let Some(block_device) = fs_creation_ctx.cloned_block_device() {
+                fs_and_root.set_block_device(block_device);
+            }
             Ok(fs_and_root)
         })();
 

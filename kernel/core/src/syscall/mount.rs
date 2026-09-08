@@ -247,7 +247,11 @@ fn open_fs(
     let data = data.as_deref().map(CStr::to_string_lossy);
 
     let mut fs_creation_ctx = FsCreationCtx::new(source, flags.into(), data.as_deref(), ctx);
-    fs_type.get_or_create(&mut fs_creation_ctx)
+    let mut fs_and_root = fs_type.get_or_create(&mut fs_creation_ctx)?;
+    if let Some(block_device) = fs_creation_ctx.cloned_block_device() {
+        fs_and_root.set_block_device(block_device);
+    }
+    Ok(fs_and_root)
 }
 
 bitflags! {
