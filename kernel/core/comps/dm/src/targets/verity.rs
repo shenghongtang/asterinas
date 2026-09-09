@@ -532,14 +532,8 @@ impl VerityReadCtx {
         let data_block = vec![0u8; target.data_block_size].into_boxed_slice();
         let hash_scratch = vec![0u8; target.hash_block_size].into_boxed_slice();
         let digest_buf = vec![0u8; digest_size].into_boxed_slice();
-        let data_seg = BioSegment::alloc(
-            target.data_block_size / BLOCK_SIZE,
-            BioDirection::FromDevice,
-        );
-        let hash_seg = BioSegment::alloc(
-            target.hash_block_size / BLOCK_SIZE,
-            BioDirection::FromDevice,
-        );
+        let data_seg = BioSegment::alloc_with_len(target.data_block_size, BioDirection::FromDevice);
+        let hash_seg = BioSegment::alloc_with_len(target.hash_block_size, BioDirection::FromDevice);
 
         let block_index = device_offset / target.data_block_size as u64;
         Some(Arc::new(Self {
@@ -705,10 +699,21 @@ impl VerityReadCtx {
             };
             inner.device_offset = next_device_offset;
 
-            // If we exhausted this data block, fetch the next one.
+            // If we exhausted this data block, the next verified block has
+            // to be fetched. But when the bio has been completely filled at
+            // the same time (the bio ends exactly on a data block boundary),
+            // there is nothing more to read and we are done.
             if within_block + chunk >= target.data_block_size {
                 inner.block_index += 1;
                 inner.level_rev_idx = PHASE_DATA;
+
+                if inner.seg_offset >= nbytes {
+                    inner.seg_idx += 1;
+                    inner.seg_offset = 0;
+                }
+                if inner.seg_idx >= bio.segments().len() {
+                    return NextAction::Done;
+                }
                 return NextAction::ReadData;
             }
             // Otherwise the bio segment may still need more bytes from the

@@ -759,10 +759,10 @@ impl BioSegment {
 
     /// Allocates a segment of exactly `len` bytes.
     ///
-    /// The length must be non-zero and sector-aligned. This helper is
-    /// intended for ktests that need to submit bios shorter than one
-    /// `BLOCK_SIZE`.
-    #[cfg(ktest)]
+    /// The length must be non-zero and sector-aligned. The underlying DMA
+    /// buffer is rounded up to whole blocks, so this supports I/O smaller
+    /// than one `BLOCK_SIZE` (e.g. targets whose transfer granularity is a
+    /// single sector).
     pub fn alloc_with_len(len: usize, direction: BioDirection) -> Self {
         assert!(len > 0 && len.is_multiple_of(SECTOR_SIZE));
         let nblocks = len.div_ceil(BLOCK_SIZE);
