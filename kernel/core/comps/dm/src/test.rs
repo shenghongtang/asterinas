@@ -26,7 +26,7 @@ use ostd::{
 };
 
 use crate::{
-    DmTable, DmTarget, MappedDevice,
+    DmTable, DmTarget, MappedDevice, TableError,
     targets::{linear::LinearTarget, striped::StripedTarget, verity::VerityTarget},
 };
 
@@ -2892,5 +2892,200 @@ fn verity_read_beyond_data_blocks_fails() {
         bio.submit_and_wait(mapped.as_ref()).unwrap(),
         BioStatus::IoError,
         "read past the verity data area must fail with IoError"
+    );
+}
+
+// ===========================================================================
+// Read-only enforcement tests (P0-2)
+//
+// A device marked read-only must refuse writes while still allowing reads
+// and flushes. These cases previously had zero coverage.
+// ===========================================================================
+
+/// Test: a read-only mapped device refuses writes but allows reads and
+/// flushes, and writability is restored after clearing the flag.
+#[ktest]
+fn readonly_device_refuses_writes() {
+    ensure_initialized();
+
+    let mock = MockBlockDevice::new("mock-ro", 256);
+    let mut table = DmTable::new();
+    table
+        .add_target(0, 256, DmTarget::Linear(LinearTarget::new(mock.clone(), 0)))
+        .unwrap();
+    let mapped = MappedDevice::create("dm-ro-0", table).unwrap();
+
+    // Mark the device read-only.
+    mapped.set_readonly(true);
+    assert!(mapped.is_readonly());
+
+    // Writes must be refused at the dm enqueue layer (never reach the mock).
+    let segment = BioSegment::alloc(1, BioDirection::ToDevice);
+    let bio = Bio::new(BioType::Write, Sid::new(0), vec![segment], None);
+    assert_eq!(
+        bio.submit_and_wait(mapped.as_ref()),
+        Err(BioEnqueueError::Refused),
+        "read-only device must refuse writes"
+    );
+
+    // Reads are still allowed.
+    let segment = BioSegment::alloc(1, BioDirection::FromDevice);
+    let bio = Bio::new(BioType::Read, Sid::new(0), vec![segment], None);
+    assert_eq!(
+        bio.submit_and_wait(mapped.as_ref()),
+        Ok(BioStatus::Complete),
+        "read-only device must still allow reads"
+    );
+
+    // Flushes are still allowed (a read-only device may need to flush
+    // already-persisted data).
+    let bio = Bio::new(BioType::Flush, Sid::new(0), vec![], None);
+    assert_eq!(
+        bio.submit_and_wait(mapped.as_ref()),
+        Ok(BioStatus::Complete),
+        "read-only device must still allow flushes"
+    );
+
+    // Clearing the flag restores writability.
+    mapped.set_readonly(false);
+    assert!(!mapped.is_readonly());
+    let pattern: Vec<u8> = (0..BLOCK_SIZE).map(|i| (i % 251) as u8).collect();
+    write_blocks(mapped.as_ref(), Bid::new(0), &pattern);
+    assert_eq!(
+        mock.read_bytes(0, BLOCK_SIZE),
+        pattern,
+        "write after clearing read-only should reach the backing device"
+    );
+}
+
+// ===========================================================================
+// open/close counter tests
+// ===========================================================================
+
+/// Test: `open`/`close` maintain the open count, and an unbalanced `close`
+/// saturates at zero instead of wrapping around to `u32::MAX`.
+#[ktest]
+fn open_close_count_is_balanced() {
+    ensure_initialized();
+
+    let mock = MockBlockDevice::new("mock-oc", 64);
+    let mut table = DmTable::new();
+    table
+        .add_target(0, 64, DmTarget::Linear(LinearTarget::new(mock, 0)))
+        .unwrap();
+    let mapped = MappedDevice::create("dm-oc-0", table).unwrap();
+
+    assert_eq!(mapped.open_count(), 0, "fresh device has zero open count");
+
+    mapped.open().unwrap();
+    assert_eq!(mapped.open_count(), 1);
+    mapped.open().unwrap();
+    assert_eq!(mapped.open_count(), 2);
+
+    mapped.close();
+    assert_eq!(mapped.open_count(), 1);
+    mapped.close();
+    assert_eq!(mapped.open_count(), 0);
+
+    // Extra (unbalanced) closes must not wrap the counter to u32::MAX.
+    mapped.close();
+    assert_eq!(
+        mapped.open_count(),
+        0,
+        "unbalanced close must saturate at 0"
+    );
+    mapped.close();
+    assert_eq!(mapped.open_count(), 0);
+}
+
+// ===========================================================================
+// Table lookup and construction tests
+// ===========================================================================
+
+/// Test: `find_target` routes sectors to the correct entry via binary
+/// search, including exact boundaries and the out-of-range case.
+#[ktest]
+fn find_target_binary_search_boundaries() {
+    let mock = MockBlockDevice::new("mock-lookup", 256);
+    let mut table = DmTable::new();
+    // [0, 8) linear, [8, 16) zero, [16, 24) error.
+    table
+        .add_target(0, 8, DmTarget::Linear(LinearTarget::new(mock.clone(), 0)))
+        .unwrap();
+    table
+        .add_target(
+            8,
+            8,
+            DmTarget::Zero(crate::targets::zero::ZeroTarget::new(8)),
+        )
+        .unwrap();
+    table
+        .add_target(
+            16,
+            8,
+            DmTarget::Error(crate::targets::error::ErrorTarget::new(8)),
+        )
+        .unwrap();
+
+    // First target: start and last-sector-before-boundary.
+    assert!(matches!(table.find_target(0), Some(DmTarget::Linear(_))));
+    assert!(matches!(table.find_target(7), Some(DmTarget::Linear(_))));
+
+    // Second target boundary (sector 8 is its first sector).
+    assert!(matches!(table.find_target(8), Some(DmTarget::Zero(_))));
+    assert!(matches!(table.find_target(15), Some(DmTarget::Zero(_))));
+
+    // Third target.
+    assert!(matches!(table.find_target(16), Some(DmTarget::Error(_))));
+    assert!(matches!(table.find_target(23), Some(DmTarget::Error(_))));
+
+    // Past the end of the table: no target.
+    assert!(table.find_target(24).is_none());
+    assert!(table.find_target(u64::MAX).is_none());
+}
+
+/// Test: `add_target` rejects zero-length entries, non-contiguous entries,
+/// and total sector counts that overflow.
+#[ktest]
+fn add_target_rejects_invalid_tables() {
+    let mock = MockBlockDevice::new("mock-invalid", 256);
+
+    // Zero-length target.
+    let mut table = DmTable::new();
+    assert!(matches!(
+        table.add_target(0, 0, DmTarget::Linear(LinearTarget::new(mock.clone(), 0))),
+        Err(TableError::ZeroLength)
+    ));
+
+    // Non-contiguous: a gap (or overlap) between entries.
+    let mut table = DmTable::new();
+    table
+        .add_target(0, 8, DmTarget::Linear(LinearTarget::new(mock.clone(), 0)))
+        .unwrap();
+    assert!(matches!(
+        table.add_target(
+            100,
+            8,
+            DmTarget::Zero(crate::targets::zero::ZeroTarget::new(8))
+        ),
+        Err(TableError::NotContiguous)
+    ));
+
+    // Overflow: two entries whose combined length exceeds u64::MAX.
+    let half = 1u64 << 63;
+    let mut table = DmTable::new();
+    table
+        .add_target(
+            0,
+            half,
+            DmTarget::Linear(LinearTarget::new(mock.clone(), 0)),
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            table.add_target(half, half, DmTarget::Linear(LinearTarget::new(mock, 0))),
+            Err(TableError::TooLarge)
+        ),
+        "combined length wrapping past u64::MAX must be TooLarge"
     );
 }
