@@ -175,15 +175,6 @@ impl<'a> FsCreationCtx<'a> {
         }
     }
 
-    /// Returns a cloned reference to the resolved block device, if any.
-    ///
-    /// Used after `get_or_create` returns so the caller can transfer the
-    /// open device reference into the `Mount` that will own the filesystem's
-    /// lifetime.
-    pub(crate) fn cloned_block_device(&self) -> Option<Arc<dyn BlockDevice>> {
-        self.block_device().cloned()
-    }
-
     fn do_resolve_block_device(&mut self) -> Result<()> {
         let task_ctx = match &self.block_device {
             BlockDeviceResolution::Pending(task_ctx) => *task_ctx,
@@ -209,15 +200,6 @@ impl<'a> FsCreationCtx<'a> {
         let block_device = id
             .and_then(aster_block::lookup)
             .ok_or_else(|| Error::with_message(Errno::ENODEV, "the device is not found"))?;
-
-        // Notify the device that it has been opened. This allows block-layer
-        // consumers (e.g. device-mapper) to maintain an accurate open count so
-        // that `DM_DEV_REMOVE` returns `EBUSY` while the device is mounted.
-        block_device.open().map_err(|e| match e {
-            aster_block::Error::Busy => Error::with_message(Errno::EBUSY, "block device is busy"),
-            _ => Error::with_message(Errno::EIO, "failed to open block device"),
-        })?;
-
         self.block_device = BlockDeviceResolution::Resolved(block_device);
 
         Ok(())
@@ -289,27 +271,11 @@ pub(crate) struct FsCache<K: Eq + Ord + Clone + Send + Sync + 'static> {
     entries: Mutex<BTreeMap<K, WeakFsAndRoot>>,
 }
 
-/// The result of decomposing an [`FsAndRoot`] into its constituent parts.
-pub(in crate::fs) type FsAndRootParts = (
-    Arc<dyn FileSystem>,
-    Arc<Dentry>,
-    Option<Arc<dyn BlockDevice>>,
-);
-
 /// A file system paired with its root [`Dentry`].
 #[derive(Clone)]
 pub(crate) struct FsAndRoot {
     fs: Arc<dyn FileSystem>,
     root_dentry: Arc<Dentry>,
-    /// The block device that was opened for this mount, if any.
-    ///
-    /// Set only when the filesystem was freshly created (cache miss) and
-    /// `resolve_block_device` called `open()` on the device. The `Mount`
-    /// that owns this `FsAndRoot` will call `close()` on drop.
-    ///
-    /// Cache hits (deduplicated mounts) leave this as `None`; the original
-    /// mount's `Mount::drop` will call `close()`.
-    block_device: Option<Arc<dyn BlockDevice>>,
 }
 
 impl FsAndRoot {
@@ -318,25 +284,12 @@ impl FsAndRoot {
     /// This root is the file system root created from [`FileSystem::root_inode`].
     pub(crate) fn new(fs: Arc<dyn FileSystem>) -> Self {
         let root_dentry = Dentry::new_root(fs.root_inode());
-        Self {
-            fs,
-            root_dentry,
-            block_device: None,
-        }
+        Self { fs, root_dentry }
     }
 
-    /// Sets the block device that was opened for this mount.
-    ///
-    /// Called after `get_or_create` returns, if `FsCreationCtx` resolved a
-    /// block device (which also called `open()` on it).
-    pub(crate) fn set_block_device(&mut self, device: Arc<dyn BlockDevice>) {
-        self.block_device = Some(device);
-    }
-
-    /// Consumes the `FsAndRoot` and returns the file system, root dentry, and
-    /// the block device that was opened for this mount (if any).
-    pub(in crate::fs) fn into_parts(self) -> FsAndRootParts {
-        (self.fs, self.root_dentry, self.block_device)
+    /// Consumes the `FsAndRoot` and returns the file system and its root dentry.
+    pub(in crate::fs) fn into_parts(self) -> (Arc<dyn FileSystem>, Arc<Dentry>) {
+        (self.fs, self.root_dentry)
     }
 
     /// Returns a reference the file system.
@@ -365,11 +318,7 @@ impl WeakFsAndRoot {
             self.root_dentry = Arc::downgrade(&dentry);
             dentry
         });
-        Some(FsAndRoot {
-            fs,
-            root_dentry,
-            block_device: None,
-        })
+        Some(FsAndRoot { fs, root_dentry })
     }
 }
 
