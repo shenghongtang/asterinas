@@ -17,7 +17,7 @@ use super::{
 use crate::{
     errors::tcp::ListenError,
     ext::Ext,
-    iface::{BindPortConfig, BoundTcpPort, PollableIfaceMut},
+    iface::{BindPortConfig, BoundTcpPort, PacketSlice, PollableIfaceMut},
     socket::{
         option::{RawTcpOption, RawTcpSetOption},
         unbound::{RawTcpSocket, new_tcp_socket},
@@ -163,7 +163,7 @@ impl<E: Ext> TcpListener<E> {
         };
 
         // The lock on `connecting`/`connected` cannot be locked after locking `self`, otherwise we
-        // might get a deadlock. due to inconsistent lock order problems.
+        // might get a deadlock due to inconsistent lock order problems.
         connecting.values().for_each(|socket| socket.reset());
         connected.iter().for_each(|socket| socket.reset());
     }
@@ -196,6 +196,7 @@ impl<E: Ext> TcpListenerBg<E> {
         iface: &mut PollableIfaceMut<E>,
         ip_repr: &IpRepr,
         tcp_repr: &TcpRepr,
+        payload: PacketSlice<'_>,
     ) -> (TcpProcessResult, Option<Arc<TcpConnectionBg<E>>>) {
         let mut backlog = self.inner.backlog.lock();
 
@@ -215,7 +216,7 @@ impl<E: Ext> TcpListenerBg<E> {
 
         let result = match backlog
             .socket
-            .process(iface.context_mut(), ip_repr, tcp_repr)
+            .process(iface.context_mut(), ip_repr, tcp_repr, payload)
         {
             None => TcpProcessResult::Processed,
             Some((ip_repr, tcp_repr)) => TcpProcessResult::ProcessedWithReply(ip_repr, tcp_repr),
