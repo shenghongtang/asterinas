@@ -3113,3 +3113,309 @@ fn add_target_rejects_invalid_tables() {
         "combined length wrapping past u64::MAX must be TooLarge"
     );
 }
+
+// ===========================================================================
+// P0/P1 regression tests (postponed replay, split completion order, failure
+// injection, cross-mapper concurrency) — added 2026-09-15 per dm-overview.md
+// appendix B/P3 item 22.
+// ===========================================================================
+
+/// Test (P1): a bio submitted while the device is Suspending/Suspended is
+/// deferred (postponed) and replayed against the **new** active table after
+/// resume. This is the core P1 semantic fix: Linux queues `dm_submit_bio`
+/// into `md->deferred` and replays on resume; Asterinas matches this via
+/// `DmIoState::push_deferred` + `take_deferred` in `set_suspended(false)`.
+///
+/// Without this test, regressions that silently re-introduce the old "Refused
+/// during suspend" behavior (filesystem sees fake EIO) would not be caught.
+#[ktest]
+fn postponed_bio_replays_against_new_table_after_resume() {
+    ensure_initialized();
+
+    // Backing A: initial table. Backing B: post-resume table.
+    let mock_a = MockBlockDevice::new("mock-post-a", 256);
+    let mock_b = MockBlockDevice::new("mock-post-b", 256);
+
+    let mut table_a = DmTable::new();
+    table_a
+        .add_target(0, 256, DmTarget::Linear(LinearTarget::new(mock_a.clone(), 0)))
+        .unwrap();
+    let mapped = MappedDevice::create("dm-post-0", table_a).unwrap();
+
+    // Suspend (no in-flight I/O, so drain returns immediately).
+    mapped.set_suspended(true);
+    assert!(mapped.is_suspended());
+
+    // Load a new inactive table pointing to mock_b.
+    let mut table_b = DmTable::new();
+    table_b
+        .add_target(0, 256, DmTarget::Linear(LinearTarget::new(mock_b.clone(), 0)))
+        .unwrap();
+    mapped.load_table(table_b).unwrap();
+
+    // Submit a write while suspended — it must be deferred, not refused.
+    let segment = BioSegment::alloc(1, BioDirection::ToDevice);
+    let pattern: Vec<u8> = (0..BLOCK_SIZE).map(|i| (i % 239) as u8).collect();
+    segment
+        .write(0, &mut VmReader::from(pattern.as_slice()).to_fallible())
+        .unwrap();
+    let bio = Bio::new(BioType::Write, Sid::new(0), vec![segment], None);
+    let mut io_batch = IoBatch::new();
+    bio.submit(mapped.as_ref(), &mut io_batch).unwrap();
+
+    // No I/O has reached either backing device yet.
+    assert!(
+        mock_a.read_bytes(0, BLOCK_SIZE).iter().all(|&b| b == 0),
+        "old target must not receive writes while suspended"
+    );
+    assert!(
+        mock_b.read_bytes(0, BLOCK_SIZE).iter().all(|&b| b == 0),
+        "new target must not receive writes until resume replays"
+    );
+    assert_eq!(
+        mapped.deferred_len(),
+        1,
+        "bio should be in the deferred queue, not submitted to the active table"
+    );
+
+    // Resume: swaps inactive→active, then replays deferred bios against the
+    // new table.
+    mapped.set_suspended(false);
+    io_batch.wait_all().unwrap();
+
+    assert!(
+        mock_a.read_bytes(0, BLOCK_SIZE).iter().all(|&b| b == 0),
+        "old target must remain untouched after resume (deferred replay uses new table)"
+    );
+    assert_eq!(
+        mock_b.read_bytes(0, BLOCK_SIZE),
+        pattern,
+        "deferred write must replay against the new active table"
+    );
+    assert_eq!(mapped.in_flight(), 0);
+}
+
+/// Test (P1): a split bio's parent completes correctly regardless of the
+/// order in which its child sub-bios complete. The completion aggregator
+/// must not assume in-order completion; any ordering must yield the same
+/// final status (Complete when all succeed).
+///
+/// This guards the P1 fix where suspend TOCTOU was eliminated by packing
+/// the suspended bit and in-flight count into a single `AtomicU32`; the
+/// same atomic decrement path is used by split bio completion, so a
+/// regression here would indicate the counter is not being updated
+/// correctly under out-of-order completion.
+#[ktest]
+fn split_bio_completes_regardless_of_child_order() {
+    ensure_initialized();
+
+    // Two-backing-device table; a bio spanning both targets is split.
+    let mock_a = DeferredBlockDevice::new("mock-split-a", 128);
+    let mock_b = DeferredBlockDevice::new("mock-split-b", 128);
+    let mut table = DmTable::new();
+    table
+        .add_target(0, 128, DmTarget::Linear(LinearTarget::new(mock_a.clone(), 0)))
+        .unwrap();
+    table
+        .add_target(128, 128, DmTarget::Linear(LinearTarget::new(mock_b.clone(), 0)))
+        .unwrap();
+    let mapped = MappedDevice::create("dm-split-ord", table).unwrap();
+
+    // Submit a read spanning both targets (BLOCK_SIZE = 8 sectors; submit
+    // 32 sectors = 4 blocks). Start at sector 112 so the bio crosses the
+    // 128-sector target boundary: [112,128) → target A, [128,144) → target B.
+    let nblocks = 4;
+    let segment = BioSegment::alloc(nblocks, BioDirection::FromDevice);
+    let bio = Bio::new(BioType::Read, Sid::new(112), vec![segment], None);
+    let mut io_batch = IoBatch::new();
+    bio.submit(mapped.as_ref(), &mut io_batch).unwrap();
+
+    // Both backings hold one sub-bio each.
+    assert_eq!(mock_a.pending_count(), 1);
+    assert_eq!(mock_b.pending_count(), 1);
+    assert_eq!(
+        mapped.in_flight(),
+        1,
+        "parent bio in-flight until all children done"
+    );
+
+    // Complete in reverse order (B first, then A). The parent must still
+    // complete successfully.
+    mock_b.complete_pending();
+    // Parent not done yet; only one child has completed.
+    assert_eq!(
+        mapped.in_flight(),
+        1,
+        "parent still in-flight while one child pending"
+    );
+
+    mock_a.complete_pending();
+    io_batch.wait_all().unwrap();
+    assert_eq!(
+        mapped.in_flight(),
+        0,
+        "parent must complete once all children complete"
+    );
+}
+
+/// Test (P1): when one child of a split bio fails, the parent bio's status
+/// becomes `IoError` even if other children succeed. This matches Linux's
+/// `dm_end_io` semantics: a single sub-bio error propagates to the parent.
+///
+/// Combined with the previous test, this verifies the completion aggregator
+/// handles both success and failure paths under arbitrary ordering.
+#[ktest]
+fn split_bio_propagates_child_failure_to_parent() {
+    ensure_initialized();
+
+    let mock_ok = DeferredBlockDevice::new("mock-fail-ok", 128);
+    let mock_bad = RefusingBlockDevice::new("mock-fail-bad", 128);
+    let mut table = DmTable::new();
+    table
+        .add_target(0, 128, DmTarget::Linear(LinearTarget::new(mock_ok.clone(), 0)))
+        .unwrap();
+    table
+        .add_target(128, 128, DmTarget::Linear(LinearTarget::new(mock_bad, 0)))
+        .unwrap();
+    let mapped = MappedDevice::create("dm-fail-split", table).unwrap();
+
+    // Submit a read spanning both targets. The first half lands on mock_ok
+    // (deferred); the second half lands on mock_bad which refuses enqueue.
+    // We cannot use submit_and_wait here because mock_ok's child is
+    // deferred and will not complete until complete_pending() is called.
+    // Instead, submit the bio, manually complete the deferred child, then
+    // wait for the parent to finish.
+    let nblocks = 4;
+    let segment = BioSegment::alloc(nblocks, BioDirection::FromDevice);
+    let bio = Bio::new(BioType::Read, Sid::new(112), vec![segment], None);
+    let mut io_batch = IoBatch::new();
+    bio.submit(mapped.as_ref(), &mut io_batch).unwrap();
+
+    // Complete the deferred child on mock_ok. Now both children have
+    // reported: mock_ok's child with Complete, mock_bad's child with
+    // IoError (via complete_child in the DM split path).
+    mock_ok.complete_pending();
+
+    // The parent's aggregate status is IoError — the first non-Complete
+    // child status wins, matching Linux's dm_end_io semantics.
+    assert!(
+        io_batch.wait_all().is_err(),
+        "parent must report IoError when any child fails"
+    );
+    assert_eq!(
+        mapped.in_flight(),
+        0,
+        "in-flight must balance even on failure"
+    );
+}
+
+/// Test (P1): two mapped devices sharing the same underlying backing device
+/// can issue concurrent I/O without interfering with each other. This is
+/// the simplest cross-mapper concurrency regression: both mappers' in-flight
+/// counters must be independent, and the underlying device must receive all
+/// writes intact.
+///
+/// This guards against regressions where the in-flight counter or suspended
+/// flag is accidentally shared (e.g., via a `static` instead of per-device
+/// state).
+#[ktest]
+fn cross_mapper_concurrent_io_to_shared_backing() {
+    ensure_initialized();
+
+    let shared = MockBlockDevice::new("mock-shared", 256);
+
+    // mapper_a: [0,128) -> shared [0,128)
+    let mut table_a = DmTable::new();
+    table_a
+        .add_target(0, 128, DmTarget::Linear(LinearTarget::new(shared.clone(), 0)))
+        .unwrap();
+    let mapper_a = MappedDevice::create("dm-cross-a", table_a).unwrap();
+
+    // mapper_b: [0,128) -> shared [128,256)
+    let mut table_b = DmTable::new();
+    table_b
+        .add_target(0, 128, DmTarget::Linear(LinearTarget::new(shared.clone(), 128)))
+        .unwrap();
+    let mapper_b = MappedDevice::create("dm-cross-b", table_b).unwrap();
+
+    // Two tasks, each writes a distinct pattern to its own mapper.
+    let done = Arc::new(AtomicUsize::new(0));
+    let mismatches = Arc::new(AtomicUsize::new(0));
+    let mapper_a_child = mapper_a.clone();
+    let mapper_b_child = mapper_b.clone();
+    let done_a = done.clone();
+    let done_b = done.clone();
+    let mismatches_a = mismatches.clone();
+    let mismatches_b = mismatches.clone();
+
+    let pattern_a: Vec<u8> = (0..2 * BLOCK_SIZE).map(|i| (i % 251) as u8).collect();
+    let pattern_b: Vec<u8> = (0..2 * BLOCK_SIZE)
+        .map(|i| ((i + 17) % 251) as u8)
+        .collect();
+    // Keep copies for post-task assertions (the originals move into closures).
+    let pattern_a_check = pattern_a.clone();
+    let pattern_b_check = pattern_b.clone();
+
+    TaskOptions::new(move || {
+        write_blocks(mapper_a_child.as_ref(), Bid::new(0), &pattern_a);
+        let read_back = read_blocks(mapper_a_child.as_ref(), Bid::new(0), 2 * BLOCK_SIZE);
+        if read_back != pattern_a {
+            mismatches_a.fetch_add(1, Ordering::AcqRel);
+        }
+        done_a.fetch_add(1, Ordering::AcqRel);
+    })
+    .data(())
+    .spawn()
+    .unwrap();
+
+    TaskOptions::new(move || {
+        write_blocks(mapper_b_child.as_ref(), Bid::new(0), &pattern_b);
+        let read_back = read_blocks(mapper_b_child.as_ref(), Bid::new(0), 2 * BLOCK_SIZE);
+        if read_back != pattern_b {
+            mismatches_b.fetch_add(1, Ordering::AcqRel);
+        }
+        done_b.fetch_add(1, Ordering::AcqRel);
+    })
+    .data(())
+    .spawn()
+    .unwrap();
+
+    let mut all_done = false;
+    for _ in 0..0x10000 {
+        Task::yield_now();
+        if done.load(Ordering::Acquire) == 2 {
+            all_done = true;
+            break;
+        }
+    }
+    assert!(all_done, "both cross-mapper tasks should finish");
+    assert_eq!(
+        mismatches.load(Ordering::Acquire),
+        0,
+        "data integrity must hold across mappers"
+    );
+
+    // Each mapper's in-flight counter is independent and returns to zero.
+    assert_eq!(
+        mapper_a.in_flight(),
+        0,
+        "mapper_a in-flight must be independent"
+    );
+    assert_eq!(
+        mapper_b.in_flight(),
+        0,
+        "mapper_b in-flight must be independent"
+    );
+
+    // Shared backing received both writes at their correct offsets.
+    assert_eq!(
+        shared.read_bytes(0, 2 * BLOCK_SIZE),
+        pattern_a_check,
+        "shared [0,128) should hold mapper_a's pattern"
+    );
+    assert_eq!(
+        shared.read_bytes(128 * SECTOR_SIZE, 2 * BLOCK_SIZE),
+        pattern_b_check,
+        "shared [128,256) should hold mapper_b's pattern"
+    );
+}
