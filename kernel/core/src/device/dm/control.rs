@@ -347,6 +347,12 @@ fn handle_ioctl(raw_ioctl: RawIoctl) -> Result<i32> {
         DM_TABLE_STATUS_NR => handle_table_status(&mut header, raw_ioctl.arg()),
         DM_LIST_VERSIONS_NR => handle_list_versions(&mut header, raw_ioctl.arg()),
         DM_DEV_SET_GEOMETRY_NR => handle_dev_set_geometry(&mut header),
+        // DM_DEV_ARM_POLL (0x10) is part of the newer dmsetup event polling
+        // interface and is not implemented; report ENOTTY like Linux does for
+        // unknown commands instead of silently treating it as a version query.
+        DM_DEV_ARM_POLL_NR => {
+            return_errno_with_message!(Errno::ENOTTY, "DM_DEV_ARM_POLL is not supported");
+        }
         DM_GET_TARGET_VERSION_NR => handle_get_target_version(&mut header, raw_ioctl.arg()),
         _ => {
             return_errno_with_message!(Errno::ENOTTY, "unsupported DM ioctl command");
@@ -432,14 +438,31 @@ impl DataAreaWriter {
 
     /// Writes the buffered entries to the ioctl's data area.
     ///
-    /// Returns `ENOSPC` if the entries do not fit within `data_size`.
-    fn commit(self, header: &DmIoctl, arg: usize) -> Result<()> {
+    /// `entry_sizes` gives the padded size of each entry in build order.
+    fn commit_entries(
+        self,
+        header: &mut DmIoctl,
+        arg: usize,
+        entry_sizes: &[usize],
+    ) -> Result<usize> {
         let ds = data_start(header);
-        if ds + self.buf.len() > header.data_size as usize {
-            return_errno_with_message!(Errno::ENOSPC, "buffer too small for ioctl data");
+        let capacity = header.data_size as usize - ds;
+
+        // Linux list-style semantics: write as many complete entries as fit.
+        // If one or more entries do not fit, set DM_BUFFER_FULL_FLAG and still
+        // return success; userspace grows its buffer and retries.
+        let mut written_entries = 0usize;
+        let mut written_len = 0usize;
+        for &size in entry_sizes {
+            if written_len + size > capacity {
+                header.flags |= DM_BUFFER_FULL_FLAG;
+                break;
+            }
+            written_len += size;
+            written_entries += 1;
         }
-        current_userspace!().write_bytes(arg + ds, &self.buf)?;
-        Ok(())
+        current_userspace!().write_bytes(arg + ds, &self.buf[..written_len])?;
+        Ok(written_entries)
     }
 }
 
@@ -555,7 +578,8 @@ fn handle_remove_all(header: &mut DmIoctl) -> Result<()> {
     let mut removed = 0u32;
     for (name, id) in devices {
         match MappedDevice::remove_by_name(name.as_ref()) {
-            Ok(_device) => {
+            Ok(device) => {
+                device.fail_deferred_bios();
                 remove_dev_node(name.as_ref(), id);
                 removed += 1;
                 ostd::debug!("remove_all: removed dm device '{}' (id={:?})", name, id,);
@@ -611,8 +635,8 @@ fn handle_list_devices(header: &mut DmIoctl, arg: usize) -> Result<()> {
         writer.end_entry(entry_start);
     }
 
-    writer.commit(header, arg)?;
-    header.target_count = devices.len() as u32;
+    let written = writer.commit_entries(header, arg, &entry_sizes)?;
+    header.target_count = written as u32;
     Ok(())
 }
 
@@ -751,34 +775,31 @@ fn handle_dev_remove(header: &mut DmIoctl) -> Result<()> {
     }
 
     // Attempt a full unregister: removes the device from the DM and block
-    // registries and recycles its minor number. This fixes the minor leak and
-    // the `dmsetup ls` residual-device problems (P1-3). If the block layer
-    // reports the device as busy (e.g. a filesystem is mounted on it via a
-    // lease), fall back to the legacy reset-only path so the caller can retry
-    // after unmounting.
-
-    // Bump the event number before destroying the device so any threads
-    // blocked in DM_DEV_WAIT wake up and don't get stuck forever waiting on
-    // an event that can never come (the device is about to be removed).
-    // Matches Linux's per-device event counter semantics for dev removal.
-    device.bump_event_nr();
-
+    // registries and recycles its minor number (P1-3). `DmManager::remove`
+    // already rolls the registry entry back on Busy, so on failure the device
+    // is fully intact and must be left untouched: Linux returns -EBUSY and the
+    // caller (LVM2/dmsetup) retries after releasing the holder.
     match MappedDevice::remove_by_name(&name) {
-        Ok(_) => {
+        Ok(removed) => {
+            // Bump the event number only after the device has actually been
+            // destroyed, so any threads blocked in DM_DEV_WAIT wake up rather
+            // than waiting on an event that can never come.
+            removed.bump_event_nr();
+            // Fail any bios that were deferred while the device was
+            // suspended; the device is gone so they can never be replayed.
+            removed.fail_deferred_bios();
             remove_dev_node(&name, id);
             ostd::info!("removed dm device '{}' (id={:?})", name, id);
             Ok(())
         }
         Err(aster_dm::DmError::DeviceBusy) => {
-            // Busy (e.g. mounted filesystem holding a lease): keep the device
-            // registered but clear its tables and UUID, matching the legacy
-            // behavior. The device will be fully removable once the lease is
-            // released.
-            ostd::debug!("dm device '{}' is busy; falling back to reset", name);
-            device.reset();
-            let _ = device.set_uuid("");
-            remove_dev_node(&name, id);
-            Ok(())
+            // The device is still in use (e.g. a nested DM target holds a
+            // lease on it). Keep the device, its tables, UUID and devtmpfs
+            // nodes exactly as they are and report EBUSY, matching Linux.
+            Err(Error::with_message(
+                Errno::EBUSY,
+                "device is in use and cannot be removed",
+            ))
         }
         Err(aster_dm::DmError::NotFound) => {
             Err(Error::with_message(Errno::ENXIO, "device not found"))
@@ -930,16 +951,18 @@ fn handle_dev_status(header: &mut DmIoctl) -> Result<()> {
 
 /// DM_DEV_WAIT - waits for the next event on a device.
 ///
-/// If the device's current event number is not greater than the caller's
-/// `header.event_nr`, blocks until `load_table`, `clear_table`, or
-/// `set_suspended` bumps the counter. The returned header reflects the
+/// If the device's current event number equals the caller's
+/// `header.event_nr`, blocks until a device event bumps the counter
+/// (device removal or a target-originated event). Inequality (not
+/// "greater than") makes the check correct across `u32` wrap-around,
+/// matching Linux's `dm_wait_event()`. The returned header reflects the
 /// latest device status and the new event number.
 fn handle_dev_wait(header: &mut DmIoctl) -> Result<()> {
     let device = lookup_device(header)
         .ok_or_else(|| Error::with_message(Errno::ENXIO, "device not found"))?;
 
     let last = header.event_nr;
-    if device.event_nr() <= last {
+    if device.event_nr() == last {
         device.wait_event(last);
     }
 
@@ -1112,10 +1135,11 @@ fn handle_table_clear(header: &mut DmIoctl) -> Result<()> {
 /// [dm_target_deps header (8 bytes: count u32 + padding u32)]
 /// [dev array (count * 8 bytes: u64 each)]
 /// ```
-/// The `target_count` field in the `dm_ioctl` header is set to 1 (one deps
-/// structure). If the provided buffer is too small, `count` is still set to
-/// the actual number of dependencies so the caller can retry with a larger
-/// buffer.
+/// The `target_count` field in the `dm_ioctl` header is set to 1 when a table
+/// is present and 0 otherwise. If the provided buffer is too small,
+/// `data_size` is set to the required size and `ENOMEM` is returned (nothing
+/// is copied), matching Linux's `table_deps()`; the caller retries with a
+/// larger buffer. `DM_QUERY_INACTIVE_TABLE_FLAG` selects the inactive table.
 fn handle_table_deps(header: &mut DmIoctl, arg: usize) -> Result<()> {
     let device = lookup_device(header)
         .ok_or_else(|| Error::with_message(Errno::ENXIO, "device not found"))?;
@@ -1127,46 +1151,39 @@ fn handle_table_deps(header: &mut DmIoctl, arg: usize) -> Result<()> {
     header.set_uuid(device.uuid().as_ref());
     update_dev_status(header, &device);
 
-    // Linux returns success with count=0 when no table is loaded.
-    let table = match device.table() {
-        Some(t) => t,
-        None => {
-            let ds = data_start(header);
-            let buf = [0u8; TARGET_DEPS_HEADER_SIZE]; // count=0 + padding=0
-            current_userspace!().write_bytes(arg + ds, &buf)?;
-            header.target_count = 0;
-            return Ok(());
-        }
+    // Honor DM_QUERY_INACTIVE_TABLE_FLAG like Linux's table_deps(): inspect
+    // the inactive table (loaded but not yet swapped in) instead of the live
+    // one.
+    let table = if header.flags & DM_QUERY_INACTIVE_TABLE_FLAG != 0 {
+        device.inactive_table()
+    } else {
+        device.table()
     };
 
-    let deps = table.deps();
+    // dm_target_deps layout: count(4) + padding(4) + dev[count] (u64 each).
+    // Linux returns success with target_count=0 when no table is loaded.
+    let deps: Vec<_> = table.as_ref().map(|t| t.deps()).unwrap_or_default();
     let count = deps.len() as u32;
-
-    let ds = data_start(header);
-    // dm_target_deps header: count(4) + padding(4)
-    // dev array: one encoded u64 per dependency
     let needed = TARGET_DEPS_HEADER_SIZE + deps.len() * size_of::<u64>();
 
-    // Always write the count + padding so the caller knows the needed size
-    // even if the dev array doesn't fit.
-    let mut buf = Vec::with_capacity(needed.min(header.data_size as usize - ds));
-    buf.extend_from_slice(&count.to_le_bytes()); // count
-    buf.extend_from_slice(&0u32.to_le_bytes()); // padding
-
-    if ds + needed <= header.data_size as usize {
-        // Buffer is large enough - append the dev array.
-        for dev_id in &deps {
-            buf.extend_from_slice(&dev_id.as_encoded_u64().to_le_bytes());
-        }
-        header.target_count = 1;
-    } else {
-        // Buffer too small - set data_size to the needed size so the caller
-        // can retry. The count has already been written so the caller knows
-        // how many devices to expect.
+    let ds = data_start(header);
+    if header.data_size as usize - ds < needed {
+        // Linux's table_deps() sets data_size to the required size and returns
+        // -ENOMEM (nothing is copied); userspace retries with a larger buffer.
         header.data_size = (ds + needed) as u32;
+        return_errno_with_message!(Errno::ENOMEM, "buffer too small for target deps");
     }
 
+    let mut buf = Vec::with_capacity(needed);
+    buf.extend_from_slice(&count.to_le_bytes()); // count
+    buf.extend_from_slice(&0u32.to_le_bytes()); // padding
+    for dev_id in &deps {
+        buf.extend_from_slice(&dev_id.as_encoded_u64().to_le_bytes());
+    }
     current_userspace!().write_bytes(arg + ds, &buf)?;
+    // Legacy semantics: target_count is 1 when a table is present, regardless
+    // of how many underlying devices the deps array contains.
+    header.target_count = u32::from(table.is_some());
     Ok(())
 }
 
@@ -1249,8 +1266,8 @@ fn handle_table_status(header: &mut DmIoctl, arg: usize) -> Result<()> {
         writer.end_entry(entry_start);
     }
 
-    writer.commit(header, arg)?;
-    header.target_count = infos.len() as u32;
+    let written = writer.commit_entries(header, arg, &entry_sizes)?;
+    header.target_count = written as u32;
     Ok(())
 }
 
@@ -1297,8 +1314,8 @@ fn handle_list_versions(header: &mut DmIoctl, arg: usize) -> Result<()> {
         writer.end_entry(entry_start);
     }
 
-    writer.commit(header, arg)?;
-    header.target_count = targets.len() as u32;
+    let written = writer.commit_entries(header, arg, &entry_sizes)?;
+    header.target_count = written as u32;
     Ok(())
 }
 
@@ -1318,7 +1335,16 @@ fn handle_get_target_version(header: &mut DmIoctl, arg: usize) -> Result<()> {
         .ok_or_else(|| Error::with_message(Errno::EINVAL, "unknown target type"))?;
 
     // Single entry: next(4) + version[3](12) + name + null, padded to 8.
+    // Linux's target_version() returns ENOMEM with data_size set when the
+    // entry does not fit (no partial copy); callers retry with a larger
+    // buffer.
     let entry_size = align8(TARGET_VERSIONS_ENTRY_FIXED + target_name.len() + 1);
+    let ds = data_start(header);
+    if header.data_size as usize - ds < entry_size {
+        header.data_size = (ds + entry_size) as u32;
+        return_errno_with_message!(Errno::ENOMEM, "buffer too small for target version");
+    }
+
     let mut writer = DataAreaWriter::with_capacity(entry_size);
     writer.extend_from_slice(&0u32.to_le_bytes()); // next = 0 (single entry)
     for &v in &version {
@@ -1328,7 +1354,7 @@ fn handle_get_target_version(header: &mut DmIoctl, arg: usize) -> Result<()> {
     writer.push(0); // null terminator
     writer.end_entry(0);
 
-    writer.commit(header, arg)?;
+    current_userspace!().write_bytes(arg + ds, writer.as_slice())?;
     header.target_count = 1;
     Ok(())
 }

@@ -596,6 +596,21 @@ pub enum BioType {
     // TODO: Add support for other BIO types, such as discarding sectors.
 }
 
+impl BioType {
+    /// Returns whether the bio mutates the device contents.
+    ///
+    /// Read-only devices must refuse every write-like bio, not only plain
+    /// writes: a discard or a write-zeroes request also destroys existing
+    /// data. When those bio types are introduced, they must be added here so
+    /// that all read-only enforcement sites keep blocking them.
+    pub fn is_write_like(self) -> bool {
+        match self {
+            BioType::Write => true,
+            BioType::Read | BioType::Flush => false,
+        }
+    }
+}
+
 /// The status of `Bio`.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromInt)]

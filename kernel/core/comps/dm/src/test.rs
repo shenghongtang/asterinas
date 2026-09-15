@@ -1601,7 +1601,8 @@ fn error_write_fails() {
 // resume allows it, and rename updates the registry.
 // ===========================================================================
 
-/// Test: a suspended device refuses I/O with `BioEnqueueError::Refused`.
+/// Test: while suspended, new I/O is deferred (not failed) and replayed on
+/// resume — matching Linux's `md->deferred` semantics.
 #[ktest]
 fn suspend_blocks_io() {
     ensure_initialized();
@@ -1616,21 +1617,32 @@ fn suspend_blocks_io() {
     // Sanity: device is resumed (create() resumes).
     assert!(!mapped.is_suspended());
 
-    // Suspend and verify I/O is refused.
+    // Suspend. New bios are now deferred instead of being refused.
     mapped.set_suspended(true);
     assert!(mapped.is_suspended());
 
+    // Submit a read asynchronously. It must not be refused; instead it is
+    // queued in the deferred list and not yet completed.
     let segment = BioSegment::alloc(1, BioDirection::FromDevice);
     let bio = Bio::new(BioType::Read, Sid::new(0), vec![segment], None);
-    let result = bio.submit_and_wait(mapped.as_ref());
+    let mut io_batch = IoBatch::new();
+    assert!(
+        bio.submit(mapped.as_ref(), &mut io_batch).is_ok(),
+        "suspended device should defer I/O, not refuse it"
+    );
     assert_eq!(
-        result,
-        Err(BioEnqueueError::Refused),
-        "suspended device should refuse I/O"
+        mapped.deferred_len(),
+        1,
+        "bio issued while suspended must be deferred"
     );
 
-    // Resume and verify I/O works again.
+    // Resume replays the deferred bio against the active table.
     mapped.set_suspended(false);
+    assert!(!mapped.is_suspended());
+    assert_eq!(mapped.deferred_len(), 0, "deferred bios must be replayed");
+    io_batch.wait_all().unwrap();
+
+    // Reads work normally after resume.
     let read_buf = read_blocks(mapped.as_ref(), Bid::new(0), BLOCK_SIZE);
     assert!(
         read_buf.iter().all(|&b| b == 0),
@@ -1704,17 +1716,22 @@ fn enqueue_error_keeps_in_flight_balanced() {
     assert!(bio.submit_and_wait(mapped.as_ref()).is_err());
     assert_eq!(mapped.in_flight(), 0);
 
-    // Refusals taken before the counter is incremented (suspended device)
-    // must leave it untouched as well.
+    // Bios issued while suspended are deferred (not counted as in-flight).
+    // On resume the deferred bio is replayed: submit() increments the
+    // counter, then the refusing backing fails map_bio and map_submitted_bio
+    // calls io.finish() to balance it. We verify the counter is balanced
+    // without waiting for the bio's completion (the refusing device consumes
+    // it without completing, so wait_all would block).
     mapped.set_suspended(true);
     let segment = BioSegment::alloc(1, BioDirection::FromDevice);
     let bio = Bio::new(BioType::Read, Sid::new(0), vec![segment], None);
-    assert_eq!(
-        bio.submit_and_wait(mapped.as_ref()),
-        Err(BioEnqueueError::Refused),
-    );
+    let mut io_batch = IoBatch::new();
+    assert!(bio.submit(mapped.as_ref(), &mut io_batch).is_ok());
+    assert_eq!(mapped.deferred_len(), 1);
+    assert_eq!(mapped.in_flight(), 0, "deferred bio must not be in-flight");
     mapped.set_suspended(false);
-    assert_eq!(mapped.in_flight(), 0);
+    assert_eq!(mapped.deferred_len(), 0, "deferred bio must be replayed on resume");
+    assert_eq!(mapped.in_flight(), 0, "replayed bio that fails must balance the counter");
 }
 
 /// Test: `rename_by_name` updates the registry so the old name is not found
@@ -2036,7 +2053,7 @@ fn table_swap_via_load_and_resume() {
 
     // Before resume the active table is still table_a.
     let pattern_a: Vec<u8> = (0..BLOCK_SIZE).map(|i| (i % 251) as u8).collect();
-    // While suspended, I/O is refused; just verify the device is suspended.
+    // While suspended, new I/O is deferred; just verify the device state.
     assert!(mapped.is_suspended());
 
     // Resume swaps the inactive table to active.
@@ -2609,22 +2626,29 @@ fn suspend_no_flush_skips_drain() {
         "no-flush suspend must not drain in-flight I/O"
     );
 
-    // New I/O is refused while suspended.
+    // New I/O is deferred (not refused) while suspended.
     let segment = BioSegment::alloc(1, BioDirection::FromDevice);
-    let bio = Bio::new(BioType::Read, Sid::new(8), vec![segment], None);
-    assert_eq!(
-        bio.submit_and_wait(mapped.as_ref()),
-        Err(BioEnqueueError::Refused),
+    let bio2 = Bio::new(BioType::Read, Sid::new(8), vec![segment], None);
+    let mut io_batch2 = IoBatch::new();
+    assert!(
+        bio2.submit(mapped.as_ref(), &mut io_batch2).is_ok(),
+        "suspended device should defer I/O, not refuse it"
     );
+    assert_eq!(mapped.deferred_len(), 1);
 
     // The still-pending read completes normally through the deferred device.
     backing.complete_pending();
     io_batch.wait_all().unwrap();
     assert_eq!(mapped.in_flight(), 0);
 
-    // Resume allows I/O again.
+    // Resume replays the deferred bio; the device accepts new I/O again.
     mapped.set_suspended(false);
     assert!(!mapped.is_suspended());
+    assert_eq!(mapped.deferred_len(), 0);
+    // The replayed bio is now pending on the backing device.
+    backing.complete_pending();
+    io_batch2.wait_all().unwrap();
+
     let segment = BioSegment::alloc(1, BioDirection::FromDevice);
     let bio = Bio::new(BioType::Read, Sid::new(16), vec![segment], None);
     let mut io_batch = IoBatch::new();

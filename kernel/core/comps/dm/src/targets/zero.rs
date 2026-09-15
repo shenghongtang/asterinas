@@ -42,6 +42,12 @@ impl Target for ZeroTarget {
     }
 
     fn map_bio(&self, bio: SubmittedBio, _logical_start: u64) -> Result<(), BioEnqueueError> {
+        // This match is exhaustive on purpose: every bio that reaches the
+        // target must be completed here. When new mutating bio types
+        // (discard, write-zeroes) are added to `BioType`, the compiler will
+        // force this match to be updated; they must complete successfully
+        // (`Complete`) just like writes, since the zero target has no backing
+        // store and any mutation trivially succeeds.
         match bio.type_() {
             // Reads: complete with `BioStatus::Zeros` so the upper layer (page
             // cache or block device read path) fills the buffer with zeros.

@@ -54,12 +54,15 @@
 
 extern crate alloc;
 
-use alloc::{collections::BTreeMap, format, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, VecDeque},
+    format, string::String, sync::Arc, vec::Vec,
+};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use aster_block::{
     BlockDevice, BlockDeviceMeta, MajorIdOwner, allocate_major_with_name,
-    bio::{BioEnqueueError, BioType, SubmittedBio},
+    bio::{BioEnqueueError, BioStatus, SubmittedBio},
 };
 use component::{ComponentInitError, init_component};
 use device_id::{DeviceId, MajorId, MinorId};
@@ -290,6 +293,9 @@ pub struct MappedDevice {
     readonly: AtomicBool,
     /// In-flight I/O tracking for suspend/resume draining.
     io: Arc<DmIoState>,
+    /// Serializes suspend/resume so that phase transitions, the table swap,
+    /// and deferred replay never interleave with another suspend/resume.
+    suspend_lock: spin::Mutex<()>,
     /// Monotonically increasing event number for `DM_DEV_WAIT`.
     event_nr: AtomicU32,
     /// Wait queue woken when the event number increases.
@@ -301,50 +307,80 @@ pub struct MappedDevice {
     open_count: AtomicU32,
 }
 
-/// Tracks in-flight I/O requests and the suspended state so that `suspend`
-/// can wait for all outstanding bios to complete before switching tables.
+/// Tracks in-flight I/O, the suspend/resume phase, and the queue of bios
+/// that arrived while the device was suspended.
 ///
-/// The suspended flag and the in-flight count are packed into a single
-/// `AtomicU32` so that [`submit`](Self::submit) can perform the
-/// "admit only if not suspended" check together with the in-flight
-/// increment as one atomic CAS. This closes the TOCTOU window where a bio
-/// could pass a separate suspended check but not yet be counted when
-/// [`drain`](Self::drain) runs, which would let I/O reach a table that has
-/// already been swapped out.
+/// The phase and the in-flight count are packed into a single `AtomicU32` so
+/// that [`submit`](Self::submit) can perform the "admit only if running"
+/// check together with the in-flight increment as one atomic CAS. This closes
+/// the TOCTOU window where a bio could pass a separate phase check but not
+/// yet be counted when [`drain`](Self::drain) runs.
+///
+/// # Phase encoding (bits 30..=31)
+///
+/// - `00` = **Running**: bios are submitted against the active table.
+/// - `01` = **Suspending**: new bios are deferred; a flush suspend is
+///   draining already-submitted bios.
+/// - `10` = **Suspended**: no new bios are admitted (they are deferred);
+///   the device is ready for a table swap.
+///
+/// Bits `0..=29` hold the in-flight bio count.
+///
+/// # Linux alignment
+///
+/// Linux uses `DMF_BLOCK_IO_FOR_SUSPEND` + `DMF_SUSPENDED` and queues bios
+/// into `md->deferred` rather than failing them. On resume the deferred
+/// bios are replayed against the (possibly new) active table. The active
+/// table is kept alive by an `Arc` held in each bio's completion closure,
+/// so a noflush resume can swap tables while old bios still complete
+/// against the previous table.
 struct DmIoState {
-    /// Bit 31: suspended flag. Bits 0..=30: in-flight bio count.
+    /// Bits 30..=31: phase. Bits 0..=29: in-flight bio count.
     state: AtomicU32,
     drained: WaitQueue,
+    /// Bios that arrived while the device was not Running; replayed on
+    /// resume.
+    deferred: spin::Mutex<VecDeque<SubmittedBio>>,
+    /// Set when the device is being destroyed so that newly-arriving bios
+    /// complete with an error instead of being deferred forever.
+    freeing: AtomicBool,
 }
 
-/// Mask for the suspended flag (bit 31) in [`DmIoState::state`].
-const SUSPENDED_BIT: u32 = 1 << 31;
-/// Mask for the in-flight count (bits 0..=30) in [`DmIoState::state`].
-const IN_FLIGHT_MASK: u32 = !SUSPENDED_BIT;
+/// Phase bits occupy the top two bits of [`DmIoState::state`].
+const PHASE_SHIFT: u32 = 30;
+const PHASE_MASK: u32 = 0b11 << PHASE_SHIFT;
+const IN_FLIGHT_MASK: u32 = !PHASE_MASK;
+const PHASE_RUNNING: u32 = 0;
+const PHASE_SUSPENDING: u32 = 1 << PHASE_SHIFT;
+const PHASE_SUSPENDED: u32 = 2 << PHASE_SHIFT;
 
 impl DmIoState {
     fn new() -> Self {
         Self {
             state: AtomicU32::new(0),
             drained: WaitQueue::new(),
+            deferred: spin::Mutex::new(VecDeque::new()),
+            freeing: AtomicBool::new(false),
         }
     }
 
     /// Atomically admits a bio: increments the in-flight count only if the
-    /// device is not suspended.
+    /// device is in the Running phase.
     ///
-    /// Returns [`BioEnqueueError::Refused`] if the device is suspended, so
-    /// the caller must not forward the bio. On success the bio is counted
-    /// as in-flight and a matching [`finish`](Self::finish) is required.
+    /// Returns [`BioEnqueueError::Refused`] if the device is not Running
+    /// (suspending or suspended); the caller then either defers the bio or
+    /// completes it with an error if the device is being freed. On success
+    /// the bio is counted as in-flight and a matching [`finish`](Self::finish)
+    /// is required.
     fn submit(&self) -> Result<(), BioEnqueueError> {
         loop {
             let cur = self.state.load(Ordering::Acquire);
-            if cur & SUSPENDED_BIT != 0 {
+            if cur & PHASE_MASK != PHASE_RUNNING {
                 return Err(BioEnqueueError::Refused);
             }
             let new = cur.wrapping_add(1);
-            // The in-flight count must never overflow into the suspended bit.
-            if new & SUSPENDED_BIT != 0 {
+            // The in-flight count must never overflow into the phase bits.
+            if new & PHASE_MASK != PHASE_RUNNING {
                 return Err(BioEnqueueError::Refused);
             }
             if self
@@ -370,38 +406,109 @@ impl DmIoState {
         }
     }
 
-    /// Blocks until no in-flight I/O remains.
+    /// Blocks until no in-flight (already-submitted) I/O remains.
     ///
-    /// The caller must have marked the device suspended first (via
-    /// [`mark_suspended`](Self::mark_suspended)) so that no new bios are
-    /// admitted while draining.
+    /// Deferred bios are **not** counted as in-flight: they have not been
+    /// submitted to any target yet and are held for replay on resume.
     fn drain(&self) {
         self.drained.wait_until(|| {
             (self.state.load(Ordering::Acquire) & IN_FLIGHT_MASK == 0).then_some(())
         });
     }
 
-    /// Sets the suspended flag atomically. After this call, `submit` will
-    /// refuse all new bios.
+    /// Transitions Running -> Suspending. New bios are now deferred instead
+    /// of being submitted.
+    fn mark_suspending(&self) {
+        loop {
+            let cur = self.state.load(Ordering::Acquire);
+            debug_assert_eq!(cur & PHASE_MASK, PHASE_RUNNING);
+            let new = (cur & IN_FLIGHT_MASK) | PHASE_SUSPENDING;
+            if self
+                .state
+                .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Transitions Suspending -> Suspended. The phase change is purely
+    /// informational for drain callers; bios continue to be deferred.
     fn mark_suspended(&self) {
-        self.state.fetch_or(SUSPENDED_BIT, Ordering::AcqRel);
+        loop {
+            let cur = self.state.load(Ordering::Acquire);
+            debug_assert_eq!(cur & PHASE_MASK, PHASE_SUSPENDING);
+            let new = (cur & IN_FLIGHT_MASK) | PHASE_SUSPENDED;
+            if self
+                .state
+                .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
     }
 
-    /// Clears the suspended flag atomically, allowing new bios to be
-    /// admitted again.
+    /// Transitions to Running so that bios are admitted again. Called after
+    /// the table swap on resume.
     fn clear_suspended(&self) {
-        self.state.fetch_and(IN_FLIGHT_MASK, Ordering::AcqRel);
+        loop {
+            let cur = self.state.load(Ordering::Acquire);
+            let new = cur & IN_FLIGHT_MASK;
+            if self
+                .state
+                .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
     }
 
-    /// Returns whether the suspended flag is set.
+    /// Returns whether the device is in the Suspending or Suspended phase.
     fn is_suspended(&self) -> bool {
-        self.state.load(Ordering::Acquire) & SUSPENDED_BIT != 0
+        let phase = self.state.load(Ordering::Acquire) & PHASE_MASK;
+        phase != PHASE_RUNNING
+    }
+
+    /// Defers a bio for replay on resume.
+    ///
+    /// Returns `Ok(())` if the bio was queued, or `Err(bio)` (returning
+    /// ownership) if the device is being freed, in which case the caller
+    /// must complete the bio with an error.
+    fn push_deferred(&self, bio: SubmittedBio) -> Result<(), SubmittedBio> {
+        if self.freeing.load(Ordering::Acquire) {
+            return Err(bio);
+        }
+        self.deferred.lock().push_back(bio);
+        Ok(())
+    }
+
+    /// Takes all deferred bios for replay.
+    fn take_deferred(&self) -> VecDeque<SubmittedBio> {
+        core::mem::take(&mut *self.deferred.lock())
+    }
+
+    /// Marks the device as being freed and completes all deferred bios with
+    /// an error, so no bio is left pending after destruction.
+    fn fail_deferred(&self) {
+        self.freeing.store(true, Ordering::Release);
+        for bio in self.take_deferred() {
+            bio.complete(BioStatus::IoError);
+        }
     }
 
     /// Returns the number of bios currently in flight.
     #[cfg(ktest)]
     fn in_flight(&self) -> usize {
         (self.state.load(Ordering::Acquire) & IN_FLIGHT_MASK) as usize
+    }
+
+    /// Returns the number of deferred bios (for tests).
+    #[cfg(ktest)]
+    fn deferred_len(&self) -> usize {
+        self.deferred.lock().len()
     }
 }
 
@@ -467,6 +574,7 @@ impl MappedDevice {
             // The suspended flag lives in DmIoState (cleared at construction).
             readonly: AtomicBool::new(false),
             io: Arc::new(DmIoState::new()),
+            suspend_lock: spin::Mutex::new(()),
             event_nr: AtomicU32::new(0),
             event_wq: WaitQueue::new(),
             open_count: AtomicU32::new(0),
@@ -502,7 +610,9 @@ impl MappedDevice {
             drop(active);
             *self.inactive_table.lock() = Some(Arc::new(table));
         }
-        self.bump_event_nr();
+        // Note: loading a table does NOT bump the per-device event number.
+        // In Linux, `md->event_nr` is incremented only by target-originated
+        // events (`dm_table_event`), never by generic control operations.
         Ok(())
     }
 
@@ -512,7 +622,6 @@ impl MappedDevice {
     /// (`lvchange -an`): suspend → clear inactive table → remove device.
     pub fn clear_table(&self) {
         *self.inactive_table.lock() = None;
-        self.bump_event_nr();
     }
 
     /// Sets the suspended state of this device.
@@ -537,37 +646,58 @@ impl MappedDevice {
     }
 
     fn set_suspended_with_flush(&self, suspended: bool, flush: bool) {
+        // Serialize all suspend/resume transitions on this device.
+        let _guard = self.suspend_lock.lock();
+
         if suspended {
-            // Suspend: mark suspended first so that no new bios are admitted
-            // (submit() atomically refuses them), then wait for all in-flight
-            // bios to complete before returning unless the caller requested a
-            // no-flush suspend.
-            self.io.mark_suspended();
+            // Running -> Suspending: new bios are now deferred instead of
+            // being submitted against the active table.
+            self.io.mark_suspending();
+            // A flush suspend waits for already-submitted bios to complete
+            // so the table quiesces before the caller inspects it. A noflush
+            // suspend returns immediately: in-flight bios keep running
+            // against the old table (kept alive by their completion Arcs).
             if flush {
                 self.io.drain();
             }
-            self.bump_event_nr();
+            // Suspending -> Suspended.
+            self.io.mark_suspended();
         } else {
-            // Resume: drain any in-flight I/O that may still be using the
-            // old active table (e.g. from a noflush suspend) before swapping
-            // in the inactive table. `drain` is safe here because the device
-            // is still suspended, so no new bios are admitted and the
-            // in-flight count is guaranteed to reach zero. This ensures no
-            // bio completes against a table that has been replaced.
-            self.io.drain();
-
-            // Swap the inactive table to active if one was loaded.
-            // Lock order must be table -> inactive_table everywhere to avoid
-            // deadlocks with reset(), table_states(), and update_dev_status().
+            // Resume: do NOT drain. Old in-flight bios keep completing
+            // against the previous active table, whose Arc they hold. We
+            // only need to (a) swap in the inactive table and (b) replay
+            // the bios that were deferred while suspended.
+            //
+            // 1. Swap the inactive table to active if one was loaded.
+            //    Lock order: table -> inactive_table.
             let mut active = self.table.lock();
             let mut inactive = self.inactive_table.lock();
             if let Some(new_table) = inactive.take() {
                 *active = Some(new_table);
             }
-            // Clear suspended only after the table swap so that bios admitted
-            // after resume see the new (active) table, not the old one.
+            drop(inactive);
+            drop(active);
+
+            // 2. Back to Running first: newly-arriving bios are now admitted
+            //    and dispatched against the (possibly new) active table. We
+            //    clear the phase BEFORE draining the deferred queue so that
+            //    any bio arriving in the window goes through the normal
+            //    submit path (and uses the new table) instead of being
+            //    pushed into a queue we just emptied.
             self.io.clear_suspended();
-            self.bump_event_nr();
+
+            // 3. Take and replay the deferred bios against the new active
+            //    table. Each deferred bio must be re-admitted (submit) and
+            //    then mapped. clear_suspended() above guarantees submit()
+            //    succeeds here.
+            let deferred = self.io.take_deferred();
+            for bio in deferred {
+                if self.io.submit().is_ok() {
+                    let _ = self.map_submitted_bio(bio);
+                } else {
+                    bio.complete(BioStatus::IoError);
+                }
+            }
         }
     }
 
@@ -582,15 +712,23 @@ impl MappedDevice {
     }
 
     /// Bumps the event number and wakes any waiters.
+    ///
+    /// Only device-destroy and target-originated events call this; generic
+    /// control operations (load/clear/suspend/resume) do not, matching
+    /// Linux's `md->event_nr` semantics.
     pub fn bump_event_nr(&self) {
         self.event_nr.fetch_add(1, Ordering::AcqRel);
         self.event_wq.wake_all();
     }
 
-    /// Waits until the event number is greater than `last`.
+    /// Waits until the event number differs from `last`.
+    ///
+    /// Uses inequality rather than "greater than" so the wait is correct
+    /// after the `u32` counter wraps around, matching Linux's
+    /// `dm_wait_event()` (`event_nr != atomic_read(&md->event_nr)`).
     pub fn wait_event(&self, last: u32) {
         self.event_wq
-            .wait_until(|| (self.event_nr.load(Ordering::Acquire) > last).then_some(()));
+            .wait_until(|| (self.event_nr.load(Ordering::Acquire) != last).then_some(()));
     }
 
     /// Resets the device to a "freshly created" state: no tables, not suspended.
@@ -605,6 +743,11 @@ impl MappedDevice {
     pub fn reset(&self) {
         *self.table.lock() = None;
         *self.inactive_table.lock() = None;
+        // Fail any bios deferred during a prior suspend; the table is gone
+        // so they cannot be replayed. The phase is cleared implicitly by
+        // fail_deferred setting the freeing flag — new bios arriving after
+        // reset will be submitted against a None table and refused normally.
+        self.io.fail_deferred();
         self.io.clear_suspended();
     }
 
@@ -635,6 +778,12 @@ impl MappedDevice {
     #[cfg(ktest)]
     pub(crate) fn in_flight(&self) -> usize {
         self.io.in_flight()
+    }
+
+    /// Returns the number of bios deferred while suspended (tests only).
+    #[cfg(ktest)]
+    pub(crate) fn deferred_len(&self) -> usize {
+        self.io.deferred_len()
     }
 
     /// Renames the device, updating its in-memory name field.
@@ -765,37 +914,35 @@ impl MappedDevice {
     }
 }
 
-impl BlockDevice for MappedDevice {
-    fn enqueue(&self, mut bio: SubmittedBio) -> Result<(), BioEnqueueError> {
-        // P0-2: Enforce the read-only flag. Reads and flushes are allowed;
-        // writes are refused. Flush is permitted because a read-only device
-        // may still need to flush already-persisted data, and filesystems
-        // issue flush regardless of the device's writability.
-        if self.is_readonly() && bio.type_() == BioType::Write {
-            return Err(BioEnqueueError::Refused);
-        }
-
-        // P0-1: Atomically admit the bio. submit() checks the suspended flag
-        // and increments the in-flight count in a single CAS, so a bio that
-        // passes this point is guaranteed to be counted by a concurrent
-        // suspend's drain(). This closes the TOCTOU window where a bio could
-        // observe "not suspended" but not yet be in-flight when drain runs.
-        self.io.submit()?;
-
-        // Clone the table only after admission. Because the in-flight count
-        // was incremented atomically with the suspended check, any suspend
-        // that starts now will drain() and wait for this bio to finish
-        // before swapping the table.
+impl MappedDevice {
+    /// Maps an already-admitted bio against the current active table.
+    ///
+    /// The caller must have successfully called [`DmIoState::submit`] first
+    /// (so the bio is counted in-flight). This method looks up the active
+    /// table and attaches a completion closure that holds an `Arc` to it —
+    /// the **table-keepalive barrier**: even if the table is swapped out
+    /// during a noflush resume while this bio is in flight, the old table
+    /// stays alive until the bio completes, so target callbacks never touch
+    /// a freed table.
+    ///
+    /// Used both by [`enqueue`](BlockDevice::enqueue) and by resume to
+    /// replay deferred bios.
+    fn map_submitted_bio(&self, mut bio: SubmittedBio) -> Result<(), BioEnqueueError> {
         let table = self.table.lock().clone();
         match table {
             Some(table) => {
                 let io = self.io.clone();
+                let table_keepalive = table.clone();
                 bio.chain_complete_fn(move |_status| {
                     io.finish();
+                    drop(table_keepalive);
                 });
                 match table.map_bio(bio) {
                     Ok(()) => Ok(()),
                     Err(e) => {
+                        // map_bio failed: the completion closure above will
+                        // never run (the bio was not submitted downstream),
+                        // so finish the in-flight count manually.
                         self.io.finish();
                         Err(e)
                     }
@@ -805,6 +952,41 @@ impl BlockDevice for MappedDevice {
                 self.io.finish();
                 Err(BioEnqueueError::Refused)
             }
+        }
+    }
+
+    /// Completes all deferred bios with an error. Called when the device is
+    /// being removed so that no bio is left waiting on a table that no
+    /// longer exists.
+    pub fn fail_deferred_bios(&self) {
+        self.io.fail_deferred();
+    }
+}
+
+impl BlockDevice for MappedDevice {
+    fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+        // Enforce the read-only flag. Reads and flushes are allowed; every
+        // write-like request is refused.
+        if self.is_readonly() && bio.type_().is_write_like() {
+            return Err(BioEnqueueError::Refused);
+        }
+
+        // Atomically admit the bio only if the device is Running. If it is
+        // suspending or suspended, submit() fails and we defer the bio
+        // instead of returning Refused (which would surface as a spurious
+        // EIO to the filesystem). On resume the deferred bio is replayed
+        // against the active table — matching Linux's `md->deferred`.
+        match self.io.submit() {
+            Ok(()) => self.map_submitted_bio(bio),
+            Err(_) => match self.io.push_deferred(bio) {
+                Ok(()) => Ok(()),
+                // Device is being freed: complete the bio with an error
+                // rather than leaving it pending.
+                Err(bio) => {
+                    bio.complete(BioStatus::IoError);
+                    Ok(())
+                }
+            },
         }
     }
 

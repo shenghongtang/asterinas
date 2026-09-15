@@ -37,7 +37,8 @@ pub const DM_TABLE_STATUS_NR: u8 = 0x0c;
 pub const DM_LIST_VERSIONS_NR: u8 = 0x0d;
 pub const DM_TARGET_MSG_NR: u8 = 0x0e;
 pub const DM_DEV_SET_GEOMETRY_NR: u8 = 0x0f;
-pub const DM_GET_TARGET_VERSION_NR: u8 = 0x10;
+pub const DM_DEV_ARM_POLL_NR: u8 = 0x10;
+pub const DM_GET_TARGET_VERSION_NR: u8 = 0x11;
 
 // ---------------------------------------------------------------------------
 // Flags
