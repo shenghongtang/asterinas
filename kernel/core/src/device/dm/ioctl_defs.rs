@@ -76,6 +76,9 @@ pub const DM_UEVENT_GENERATED_FLAG: u32 = 1 << 13;
 pub const DM_UUID_FLAG: u32 = 1 << 14;
 /// Wipe all buffers after use when sending or requesting sensitive data.
 pub const DM_SECURE_DATA_FLAG: u32 = 1 << 15;
+/// In a `dm_name_list` entry (DM_LIST_DEVICES), indicates that a UUID field
+/// follows the name field. Matches Linux's `DM_NAME_LIST_FLAG_HAS_UUID`.
+pub const DM_NAME_LIST_FLAG_HAS_UUID: u32 = 1 << 0;
 /// Out: a message generated output data.
 pub const DM_DATA_OUT_FLAG: u32 = 1 << 16;
 /// In/Out: schedule device for removal when it gets closed if still busy.

@@ -366,13 +366,18 @@ impl DmManager {
         self.inner.read().by_name.values().cloned().collect()
     }
 
-    /// Returns a list of all registered devices as `(name, id)` pairs.
-    pub fn list_devices(&self) -> Vec<(Arc<str>, DeviceId)> {
+    /// Returns a list of all registered devices as `(name, uuid, id)` triples.
+    ///
+    /// The UUID is an empty `Arc<str>` if the device has no UUID set; callers
+    /// writing `dm_name_list` entries decide whether to append the UUID tail
+    /// (and set `DM_NAME_LIST_FLAG_HAS_UUID`) based on whether the string is
+    /// non-empty.
+    pub fn list_devices(&self) -> Vec<(Arc<str>, Arc<str>, DeviceId)> {
         self.inner
             .read()
             .by_name
             .iter()
-            .map(|(name, dev)| (name.clone(), dev.device_id()))
+            .map(|(name, dev)| (name.clone(), dev.uuid(), dev.device_id()))
             .collect()
     }
 }

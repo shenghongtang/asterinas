@@ -66,6 +66,11 @@ const DM_CTRL_MINOR: MinorId = MinorId::new(236);
 /// Fixed part of a `dm_name_list` entry: dev(8) + next(4).
 const NAME_LIST_ENTRY_FIXED: usize = 8 + 4;
 
+/// Size of the `dm_name_list.flags` field that precedes the UUID tail when
+/// `DM_NAME_LIST_FLAG_HAS_UUID` is set. Matches Linux's layout: after the
+/// null-terminated name, a `u32 flags` field, then a null-terminated UUID.
+const NAME_LIST_UUID_PREFIX: usize = 4;
+
 /// Header of a `dm_target_deps` response: count(4) + padding(4).
 const TARGET_DEPS_HEADER_SIZE: usize = 4 + 4;
 
@@ -576,7 +581,7 @@ fn handle_remove_all(header: &mut DmIoctl) -> Result<()> {
     // Snapshot the device list - remove_by_name mutates the registry.
     let devices = MappedDevice::list_devices();
     let mut removed = 0u32;
-    for (name, id) in devices {
+    for (name, _uuid, id) in devices {
         match MappedDevice::remove_by_name(name.as_ref()) {
             Ok(device) => {
                 device.fail_deferred_bios();
@@ -610,18 +615,32 @@ fn handle_remove_all(header: &mut DmIoctl) -> Result<()> {
 }
 
 /// DM_LIST_DEVICES - writes `dm_name_list` entries to the data area.
+///
+/// Each entry layout matches Linux's `struct dm_name_list`:
+/// ```text
+/// dev(8) | next(4) | name[] + NUL | [flags(4) | uuid[] + NUL]
+/// ```
+/// The `flags` + `uuid` tail is present iff the device has a non-empty UUID,
+/// in which case `DM_NAME_LIST_FLAG_HAS_UUID` is set in `flags`.
 fn handle_list_devices(header: &mut DmIoctl, arg: usize) -> Result<()> {
     let devices = MappedDevice::list_devices();
 
-    // Compute entry sizes: dev(8) + next(4) + name + null, padded to 8.
+    // Compute entry sizes. Each entry is 8-byte aligned, including the UUID
+    // tail (flags(4) + uuid + NUL) when the device has a UUID.
     let entry_sizes: Vec<usize> = devices
         .iter()
-        .map(|(name, _)| align8(NAME_LIST_ENTRY_FIXED + name.len() + 1))
+        .map(|(name, uuid, _)| {
+            let mut size = NAME_LIST_ENTRY_FIXED + name.len() + 1;
+            if !uuid.is_empty() {
+                size += NAME_LIST_UUID_PREFIX + uuid.len() + 1;
+            }
+            align8(size)
+        })
         .collect();
 
     let total: usize = entry_sizes.iter().sum();
     let mut writer = DataAreaWriter::with_capacity(total);
-    for (i, (name, id)) in devices.iter().enumerate() {
+    for (i, (name, uuid, id)) in devices.iter().enumerate() {
         let entry_start = writer.begin_entry();
         let next = if i + 1 < devices.len() {
             entry_sizes[i] as u32
@@ -631,7 +650,12 @@ fn handle_list_devices(header: &mut DmIoctl, arg: usize) -> Result<()> {
         writer.extend_from_slice(&id.as_encoded_u64().to_le_bytes()); // dev
         writer.extend_from_slice(&next.to_le_bytes()); // next
         writer.extend_from_slice(name.as_bytes()); // name
-        writer.push(0); // null terminator
+        writer.push(0); // name NUL terminator
+        if !uuid.is_empty() {
+            writer.extend_from_slice(&DM_NAME_LIST_FLAG_HAS_UUID.to_le_bytes()); // flags
+            writer.extend_from_slice(uuid.as_bytes()); // uuid
+            writer.push(0); // uuid NUL terminator
+        }
         writer.end_entry(entry_start);
     }
 
@@ -759,6 +783,16 @@ fn handle_dev_remove(header: &mut DmIoctl) -> Result<()> {
     // the request rather than silently removing the device without wiping it.
     if (header.flags & DM_SECURE_DATA_FLAG) != 0 {
         return_errno_with_message!(Errno::EOPNOTSUPP, "secure data erase is not supported");
+    }
+    // `DM_DEFERRED_REMOVE` schedules the device for removal once it becomes
+    // idle (closed by all users). Asterinas has no deferred-remove workqueue,
+    // so we reject the flag explicitly rather than silently accepting it and
+    // leaving the caller waiting for a removal that never happens.
+    if (header.flags & DM_DEFERRED_REMOVE) != 0 {
+        return_errno_with_message!(
+            Errno::EOPNOTSUPP,
+            "deferred remove is not supported"
+        );
     }
     // Use the shared lookup so UUID-based removal (used by LVM2) also works.
     let device = lookup_device(header)
@@ -955,7 +989,9 @@ fn handle_dev_status(header: &mut DmIoctl) -> Result<()> {
 /// `header.event_nr`, blocks until a device event bumps the counter
 /// (device removal or a target-originated event). Inequality (not
 /// "greater than") makes the check correct across `u32` wrap-around,
-/// matching Linux's `dm_wait_event()`. The returned header reflects the
+/// matching Linux's `dm_wait_event()`. The wait is interruptible by
+/// POSIX signals (returns `EINTR`), matching Linux's `dm_wait_event` /
+/// `wait_event_interruptible` semantics. The returned header reflects the
 /// latest device status and the new event number.
 fn handle_dev_wait(header: &mut DmIoctl) -> Result<()> {
     let device = lookup_device(header)
@@ -963,7 +999,12 @@ fn handle_dev_wait(header: &mut DmIoctl) -> Result<()> {
 
     let last = header.event_nr;
     if device.event_nr() == last {
-        device.wait_event(last);
+        // Use `Pause::pause_until` so a pending signal returns `EINTR`
+        // instead of blocking forever; this is the Linux behavior where
+        // `dm_wait_event` wraps `wait_event_interruptible`.
+        device
+            .event_wait_queue()
+            .pause_until(|| (device.event_nr() != last).then_some(()))?;
     }
 
     update_dev_status(header, &device);

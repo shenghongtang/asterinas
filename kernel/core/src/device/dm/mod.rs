@@ -31,7 +31,7 @@ pub(super) fn init_in_first_kthread() {
 /// (`DM_DEV_CREATE`). This function ensures that boot-created devices also get
 /// those nodes so that userspace tools (e.g., `dmsetup`) can find them.
 pub(super) fn init_in_first_process() {
-    for (name, device_id) in aster_dm::MappedDevice::list_devices() {
+    for (name, _uuid, device_id) in aster_dm::MappedDevice::list_devices() {
         let minor = device_id.minor().get();
         let dev = device_id.as_encoded_u64();
         control::create_dev_node(&name, dev, minor);

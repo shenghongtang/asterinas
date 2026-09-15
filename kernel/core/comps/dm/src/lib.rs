@@ -726,9 +726,24 @@ impl MappedDevice {
     /// Uses inequality rather than "greater than" so the wait is correct
     /// after the `u32` counter wraps around, matching Linux's
     /// `dm_wait_event()` (`event_nr != atomic_read(&md->event_nr)`).
+    ///
+    /// This is an uninterruptible wait; callers needing signal-aware waiting
+    /// (e.g. `DM_DEV_WAIT`) must use [`Self::event_wait_queue`] together with
+    /// the `Pause` trait.
     pub fn wait_event(&self, last: u32) {
         self.event_wq
             .wait_until(|| (self.event_nr.load(Ordering::Acquire) != last).then_some(()));
+    }
+
+    /// Returns a reference to the per-device event wait queue.
+    ///
+    /// Exposed so the kernel-side ioctl handler (in `device::dm::control`)
+    /// can drive an interruptible wait via the `Pause` trait, matching Linux's
+    /// `dm_wait_event` which is interruptible by signals. Callers in the same
+    /// crate as `Pause` should prefer `pause_until` over `wait_until` to allow
+    /// `EINTR` return on signal delivery.
+    pub fn event_wait_queue(&self) -> &WaitQueue {
+        &self.event_wq
     }
 
     /// Resets the device to a "freshly created" state: no tables, not suspended.
@@ -908,8 +923,11 @@ impl MappedDevice {
         manager().remove(name)
     }
 
-    /// Returns a list of all registered mapped devices as `(name, id)` pairs.
-    pub fn list_devices() -> Vec<(Arc<str>, DeviceId)> {
+    /// Returns a list of all registered mapped devices as `(name, uuid, id)`
+    /// triples.
+    ///
+    /// The UUID is an empty `Arc<str>` if the device has no UUID set.
+    pub fn list_devices() -> Vec<(Arc<str>, Arc<str>, DeviceId)> {
         manager().list_devices()
     }
 }
