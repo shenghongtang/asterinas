@@ -16,7 +16,7 @@ use aster_block::{
 };
 use device_id::DeviceId;
 
-use crate::target::Target;
+use crate::target::{DmTargetMetadata, Target};
 
 /// An `error` target.
 #[derive(Debug)]
@@ -24,11 +24,10 @@ pub struct ErrorTarget {
     num_sectors: u64,
 }
 
-/// Registers the `error` target type and its version.
-pub fn register() {
-    // Matches Linux's dm-error version (internal changes only).
-    crate::register_target_type("error", [1, 5, 0]);
-}
+/// Metadata of the `error` target type.
+//
+// Matches Linux's dm-error version (internal changes only).
+pub const METADATA: DmTargetMetadata = DmTargetMetadata::new("error", [1, 5, 0]);
 
 impl ErrorTarget {
     /// Creates a new `error` target.

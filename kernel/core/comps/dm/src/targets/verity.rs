@@ -30,7 +30,7 @@ use crate::{
     DmError,
     hash::{self, HashAlgorithm},
     lookup_block_device,
-    target::Target,
+    target::{DmTargetMetadata, Target},
 };
 
 /// The number of mandatory arguments in a `verity` table line.
@@ -111,13 +111,12 @@ pub struct VerityTarget {
     digest_size: usize,
 }
 
-/// Registers the `verity` target type and its version.
-pub fn register() {
-    // Linux dm-verity 1.3.0. Deliberately not 1.4.0, which introduced FEC
-    // (forward error correction) that is not implemented here; reporting
-    // 1.4.0 could lead userspace (cryptsetup) to request FEC and fail.
-    crate::register_target_type("verity", [1, 3, 0]);
-}
+/// Metadata of the `verity` target type.
+//
+// Linux dm-verity 1.3.0. Deliberately not 1.4.0, which introduced FEC
+// (forward error correction) that is not implemented here; reporting
+// 1.4.0 could lead userspace (cryptsetup) to request FEC and fail.
+pub const METADATA: DmTargetMetadata = DmTargetMetadata::new("verity", [1, 3, 0]);
 
 impl VerityTarget {
     /// Creates a new verity target from parsed table arguments.

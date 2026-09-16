@@ -91,6 +91,27 @@ pub trait Target: Send + Sync + core::fmt::Debug {
     }
 }
 
+/// Compile-time metadata describing a supported device mapper target type.
+///
+/// Each built-in target module defines a `METADATA` constant of this type;
+/// [`SUPPORTED_TARGETS`](crate::targets::SUPPORTED_TARGETS) aggregates them
+/// into the single static source of truth backing `DM_LIST_VERSIONS` and
+/// `DM_GET_TARGET_VERSION`, so there is no runtime registration step.
+#[derive(Debug, Clone, Copy)]
+pub struct DmTargetMetadata {
+    /// The target type name (e.g., `"linear"`).
+    pub name: &'static str,
+    /// The target version as `[major, minor, patch]`.
+    pub version: [u32; 3],
+}
+
+impl DmTargetMetadata {
+    /// Creates metadata for a target type.
+    pub const fn new(name: &'static str, version: [u32; 3]) -> Self {
+        Self { name, version }
+    }
+}
+
 /// An enum wrapper around all built-in device mapper target implementations.
 ///
 /// Using an enum instead of `Box<dyn Target>` removes the vtable indirection

@@ -8,15 +8,19 @@ pub mod striped;
 pub mod verity;
 pub mod zero;
 
-/// Registers all built-in target types and their versions with the global
-/// target registry.
+use crate::target::DmTargetMetadata;
+
+/// All built-in target types supported by this kernel, sorted by name.
 ///
-/// This must be called before any user-space or boot-time DM command attempts
-/// to query supported target types (e.g. via `DM_LIST_VERSIONS`).
-pub fn register_all() {
-    linear::register();
-    striped::register();
-    zero::register();
-    error::register();
-    verity::register();
-}
+/// This static slice is the single source of truth for the target type
+/// registry: `DM_LIST_VERSIONS` and `DM_GET_TARGET_VERSION` iterate it
+/// directly. Adding a new target type only requires defining its `METADATA`
+/// constant and listing it here (keeping the name-sorted order); no runtime
+/// registration or init-order handling is needed.
+pub const SUPPORTED_TARGETS: &[DmTargetMetadata] = &[
+    error::METADATA,
+    linear::METADATA,
+    striped::METADATA,
+    verity::METADATA,
+    zero::METADATA,
+];

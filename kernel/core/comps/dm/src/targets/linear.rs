@@ -18,7 +18,7 @@ use aster_block::{
 };
 use device_id::DeviceId;
 
-use crate::target::Target;
+use crate::target::{DmTargetMetadata, Target};
 
 /// A linear mapping target.
 ///
@@ -44,14 +44,13 @@ pub struct LinearTarget {
     _lease: Option<BlockDeviceLease>,
 }
 
-/// Registers the `linear` target type and its version.
-pub fn register() {
-    // Matches Linux v6.12 LTS dm-linear: 1.14.0 never existed upstream
-    // (v6.12 reports 1.4.0; mainline 1.5.0 adds atomic-write features we do
-    // not have). A fabricated higher version could make libdevmapper assume
-    // unimplemented features.
-    crate::register_target_type("linear", [1, 4, 0]);
-}
+/// Metadata of the `linear` target type.
+//
+// Matches Linux v6.12 LTS dm-linear: 1.14.0 never existed upstream
+// (v6.12 reports 1.4.0; mainline 1.5.0 adds atomic-write features we do
+// not have). A fabricated higher version could make libdevmapper assume
+// unimplemented features.
+pub const METADATA: DmTargetMetadata = DmTargetMetadata::new("linear", [1, 4, 0]);
 
 impl LinearTarget {
     /// Creates a new linear target.

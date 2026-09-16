@@ -55,7 +55,7 @@
 extern crate alloc;
 
 use alloc::{
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     format, string::String, sync::Arc, vec::Vec,
 };
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -66,7 +66,7 @@ use aster_block::{
 };
 use component::{ComponentInitError, init_component};
 use device_id::{DeviceId, MajorId, MinorId};
-use ostd::sync::{RwLock, WaitQueue};
+use ostd::sync::WaitQueue;
 use spin::Once;
 
 use crate::manager::DmManager;
@@ -215,26 +215,24 @@ pub fn lookup_block_device(name_or_id: &str) -> Result<Arc<dyn BlockDevice>, DmE
         .ok_or(DmError::NotFound)
 }
 
-/// Registry of supported device mapper target types and their versions.
-static TARGET_VERSIONS: RwLock<BTreeMap<&'static str, [u32; 3]>> = RwLock::new(BTreeMap::new());
-
-/// Registers a device mapper target type and its version.
-pub fn register_target_type(name: &'static str, version: [u32; 3]) {
-    TARGET_VERSIONS.write().insert(name, version);
-}
-
-/// Returns the list of supported target types and their versions, sorted by name.
+/// Returns the list of supported target types and their versions, sorted by
+/// name.
+///
+/// The result is built from the static [`targets::SUPPORTED_TARGETS`] slice;
+/// there is no runtime registration step.
 pub fn list_target_versions() -> Vec<(&'static str, [u32; 3])> {
-    TARGET_VERSIONS
-        .read()
+    targets::SUPPORTED_TARGETS
         .iter()
-        .map(|(&name, &version)| (name, version))
+        .map(|m| (m.name, m.version))
         .collect()
 }
 
-/// Returns the version of the named target type, if registered.
+/// Returns the version of the named target type, if supported.
 pub fn get_target_version(name: &str) -> Option<[u32; 3]> {
-    TARGET_VERSIONS.read().get(name).copied()
+    targets::SUPPORTED_TARGETS
+        .iter()
+        .find(|m| m.name == name)
+        .map(|m| m.version)
 }
 
 /// Errors that can occur when loading or validating a device mapper table.
@@ -1148,8 +1146,6 @@ fn init() -> Result<(), ComponentInitError> {
 
 #[init_component(process)]
 fn init_in_first_process() -> Result<(), ComponentInitError> {
-    targets::register_all();
-
     let create_args = DM_CREATE_ARGS.get().cloned().unwrap_or_default();
     if !create_args.is_empty() {
         ostd::info!(

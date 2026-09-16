@@ -26,7 +26,7 @@ use aster_block::{
 use device_id::DeviceId;
 use smallvec::SmallVec;
 
-use crate::target::Target;
+use crate::target::{DmTargetMetadata, Target};
 
 /// Inline capacity for the stripe ranges a single bio is split into.
 ///
@@ -67,11 +67,10 @@ pub struct StripedTarget {
     deps: Vec<DeviceId>,
 }
 
-/// Registers the `striped` target type and its version.
-pub fn register() {
-    // Linux dm-stripe 1.6.0; basic multi-stripe (RAID0) is implemented.
-    crate::register_target_type("striped", [1, 6, 0]);
-}
+/// Metadata of the `striped` target type.
+//
+// Linux dm-stripe 1.6.0; basic multi-stripe (RAID0) is implemented.
+pub const METADATA: DmTargetMetadata = DmTargetMetadata::new("striped", [1, 6, 0]);
 
 impl StripedTarget {
     /// Creates a new striped target.
