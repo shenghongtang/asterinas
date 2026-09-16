@@ -312,6 +312,16 @@ fn handle_ioctl(raw_ioctl: RawIoctl) -> Result<i32> {
         return_errno_with_message!(Errno::ENOTTY, "not a DM ioctl");
     }
 
+    // Validate the raw command encoding: every DM ioctl is encoded as
+    // `_IOWR(DM_IOCTL, nr, struct dm_ioctl)`. A mismatched direction or
+    // size field cannot correspond to a real DM ioctl, so report ENOTTY
+    // like Linux's VFS does for unmatched ioctl numbers.
+    let dir = cmd >> 30;
+    let size = ((cmd >> 16) & 0x3FFF) as usize;
+    if dir != 0b11 || size != size_of::<DmIoctl>() {
+        return_errno_with_message!(Errno::ENOTTY, "invalid DM ioctl command encoding");
+    }
+
     // Read the header from userspace.
     let mut header: DmIoctl = current_userspace!()
         .read_val(raw_ioctl.arg())
@@ -330,6 +340,13 @@ fn handle_ioctl(raw_ioctl: RawIoctl) -> Result<i32> {
     // write to it. DM_VERSION carries no data area.
     if nr != DM_VERSION_NR {
         check_data_area(&header)?;
+    }
+
+    // Reject flag bits we do not define. Linux silently ignores unknown
+    // bits, but doing so hides userspace bugs (and unsupported requests);
+    // report EINVAL instead, matching the phj reference implementation.
+    if nr != DM_VERSION_NR && (header.flags & !DM_KNOWN_FLAGS) != 0 {
+        return_errno_with_message!(Errno::EINVAL, "unknown DM ioctl flags");
     }
 
     // `DM_IMA_MEASUREMENT_FLAG` requests an IMA measurement of the ioctl
@@ -410,10 +427,25 @@ fn data_start(header: &DmIoctl) -> usize {
 /// handlers such as `handle_table_deps` (panic in debug, OOM in release),
 /// and a `data_start` smaller than the header lets the data area overlap
 /// the ioctl header.
+///
+/// Additionally (matching the phj reference implementation):
+/// - `data_start` must be 8-byte aligned, since every entry in the data
+///   area is padded to an 8-byte boundary;
+/// - `data_size` is capped at 1 MiB to bound the amount of memory a single
+///   ioctl can make the kernel read or write.
 fn check_data_area(header: &DmIoctl) -> Result<()> {
+    /// Maximum accepted `data_size` (1 MiB).
+    const DM_MAX_DATA_SIZE: usize = 1 << 20;
+
     let ds = data_start(header);
     if ds < size_of::<DmIoctl>() || ds > header.data_size as usize {
         return_errno_with_message!(Errno::EINVAL, "invalid data area description");
+    }
+    if header.data_start % 8 != 0 {
+        return_errno_with_message!(Errno::EINVAL, "data_start must be 8-byte aligned");
+    }
+    if header.data_size as usize > DM_MAX_DATA_SIZE {
+        return_errno_with_message!(Errno::EINVAL, "data_size exceeds the 1 MiB limit");
     }
     Ok(())
 }
@@ -734,7 +766,11 @@ fn handle_dev_create(header: &mut DmIoctl) -> Result<()> {
                 let minor = dev_id.minor().get();
                 create_dev_node(&name, dev, minor);
                 // Honor the read-only flag supplied at creation time.
-                existing.set_readonly(header.flags & DM_READONLY_FLAG != 0);
+                // Read-only is latched: ioctls can set it but never clear
+                // it, matching the phj reference implementation.
+                if (header.flags & DM_READONLY_FLAG) != 0 {
+                    existing.set_readonly(true);
+                }
                 update_dev_status(header, &existing);
                 return Ok(());
             }
@@ -775,8 +811,11 @@ fn handle_dev_create(header: &mut DmIoctl) -> Result<()> {
     // Create devtmpfs nodes so userspace can open the device without manual mknod.
     create_dev_node(&name, dev, minor);
 
-    // Honor the read-only flag supplied at creation time.
-    device.set_readonly(header.flags & DM_READONLY_FLAG != 0);
+    // Honor the read-only flag supplied at creation time. Read-only is
+    // latched: ioctls can set it but never clear it.
+    if (header.flags & DM_READONLY_FLAG) != 0 {
+        device.set_readonly(true);
+    }
 
     // Update header flags (device has no table yet).
     update_dev_status(header, &device);
@@ -1164,8 +1203,11 @@ fn handle_table_load(header: &mut DmIoctl, arg: usize) -> Result<()> {
         _ => Error::with_message(Errno::EINVAL, "failed to load table"),
     })?;
 
-    // Honor the read-only flag supplied with the table load.
-    device.set_readonly(header.flags & DM_READONLY_FLAG != 0);
+    // Honor the read-only flag supplied with the table load. Read-only is
+    // latched: ioctls can set it but never clear it.
+    if (header.flags & DM_READONLY_FLAG) != 0 {
+        device.set_readonly(true);
+    }
 
     update_dev_status(header, &device);
     Ok(())

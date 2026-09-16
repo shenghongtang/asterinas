@@ -88,6 +88,32 @@ pub const DM_INTERNAL_SUSPEND_FLAG: u32 = 1 << 18;
 /// Return raw table information that would be measured by IMA.
 pub const DM_IMA_MEASUREMENT_FLAG: u32 = 1 << 19;
 
+/// Mask of all defined `dm_ioctl.flags` bits.
+///
+/// Any bit outside this mask is rejected with `EINVAL` at the ioctl entry
+/// point (matching the phj reference implementation). Output-only bits are
+/// included so that userspace reusing a previously written-back buffer is
+/// not spuriously rejected.
+pub const DM_KNOWN_FLAGS: u32 = DM_READONLY_FLAG
+    | DM_SUSPEND_FLAG
+    | DM_EXISTS_FLAG
+    | DM_PERSISTENT_DEV_FLAG
+    | DM_STATUS_TABLE_FLAG
+    | DM_ACTIVE_PRESENT_FLAG
+    | DM_INACTIVE_PRESENT_FLAG
+    | DM_BUFFER_FULL_FLAG
+    | DM_SKIP_BDGET_FLAG
+    | DM_SKIP_LOCKFS_FLAG
+    | DM_NOFLUSH_FLAG
+    | DM_QUERY_INACTIVE_TABLE_FLAG
+    | DM_UEVENT_GENERATED_FLAG
+    | DM_UUID_FLAG
+    | DM_SECURE_DATA_FLAG
+    | DM_DATA_OUT_FLAG
+    | DM_DEFERRED_REMOVE
+    | DM_INTERNAL_SUSPEND_FLAG
+    | DM_IMA_MEASUREMENT_FLAG;
+
 /// The `dm_ioctl` header structure (312 bytes).
 ///
 /// This is the fixed-size header that precedes variable-length data in every
