@@ -3023,6 +3023,101 @@ fn open_close_count_is_balanced() {
 }
 
 // ===========================================================================
+// Deferred remove (DM_DEFERRED_REMOVE) tests
+// ===========================================================================
+
+/// Test: a device marked for deferred removal stays registered while open,
+/// and the last `close` completes the removal and recycles the minor.
+#[ktest]
+fn deferred_remove_completes_on_last_close() {
+    ensure_initialized();
+
+    let mock = MockBlockDevice::new("mock-dr", 64);
+    let mut table = DmTable::new();
+    table
+        .add_target(0, 64, DmTarget::Linear(LinearTarget::new(mock, 0)))
+        .unwrap();
+    let mapped = MappedDevice::create("dm-dr-0", table).unwrap();
+    let id = mapped.device_id();
+    let minor = id.minor().get();
+
+    mapped.open().unwrap();
+    mapped.open().unwrap();
+
+    // DM_DEV_REMOVE with DM_DEFERRED_REMOVE on a busy device registers the
+    // removal; the device stays listed until the last close.
+    mapped.mark_deferred_remove();
+    assert!(mapped.is_deferred_remove_pending());
+    assert!(
+        MappedDevice::lookup_by_name("dm-dr-0").is_some(),
+        "deferred-remove device must stay visible while open"
+    );
+
+    mapped.close();
+    assert_eq!(mapped.open_count(), 1);
+    assert!(
+        MappedDevice::lookup_by_name("dm-dr-0").is_some(),
+        "a non-final close must not remove the device"
+    );
+
+    mapped.close();
+    assert_eq!(mapped.open_count(), 0);
+    assert!(
+        MappedDevice::lookup_by_name("dm-dr-0").is_none(),
+        "the last close must complete the deferred removal"
+    );
+    assert!(
+        aster_block::lookup(id).is_none(),
+        "the device must be unregistered from the block layer"
+    );
+
+    // The minor is recycled: creating a device with the same explicit minor
+    // must succeed.
+    let recycled = crate::manager()
+        .create("dm-dr-recycle", None::<Arc<str>>, Some(minor))
+        .expect("the minor of the removed device must be recycled");
+    assert_eq!(recycled.device_id().minor().get(), minor);
+    MappedDevice::remove_by_name("dm-dr-recycle").unwrap();
+}
+
+/// Test: if the block layer still reports the device busy at the last
+/// `close` (e.g. an outstanding lease), the deferred flag is kept and the
+/// device survives until a later removal succeeds.
+#[ktest]
+fn deferred_remove_kept_when_block_layer_busy() {
+    ensure_initialized();
+
+    let mock = MockBlockDevice::new("mock-drb", 64);
+    let mut table = DmTable::new();
+    table
+        .add_target(0, 64, DmTarget::Linear(LinearTarget::new(mock, 0)))
+        .unwrap();
+    let mapped = MappedDevice::create("dm-dr-busy", table).unwrap();
+
+    mapped.open().unwrap();
+    mapped.mark_deferred_remove();
+
+    // Simulate a holder (e.g. a nested DM target) keeping a lease on the
+    // device while the last userspace close happens.
+    let lease = aster_block::lookup_lease(mapped.device_id()).unwrap();
+    mapped.close();
+    assert_eq!(mapped.open_count(), 0);
+    assert!(
+        mapped.is_deferred_remove_pending(),
+        "the deferred flag must be kept when the removal cannot complete"
+    );
+    assert!(
+        MappedDevice::lookup_by_name("dm-dr-busy").is_some(),
+        "the device must survive when the block layer reports busy"
+    );
+
+    // Once the holder releases the lease, a later removal succeeds.
+    drop(lease);
+    MappedDevice::remove_by_name("dm-dr-busy").unwrap();
+    assert!(MappedDevice::lookup_by_name("dm-dr-busy").is_none());
+}
+
+// ===========================================================================
 // Table lookup and construction tests
 // ===========================================================================
 

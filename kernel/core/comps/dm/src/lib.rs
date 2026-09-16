@@ -121,6 +121,22 @@ fn manager() -> &'static Arc<DmManager> {
     DM_MANAGER.get().expect("DM manager is not initialized")
 }
 
+/// Hook invoked after a deferred (`DM_DEFERRED_REMOVE`) removal completes.
+///
+/// A deferred removal is triggered from `BlockDevice::close`, which lives in
+/// this crate, while devtmpfs node cleanup lives in the kernel's
+/// `device::dm::control` module. The control module registers this hook at
+/// init time so that close-triggered removals can clean up `/dev` nodes.
+static DEFERRED_REMOVE_HOOK: Once<fn(&str, DeviceId)> = Once::new();
+
+/// Registers the hook invoked after a deferred removal completes.
+///
+/// Must be called at most once, during kernel init. The hook receives the
+/// removed device's name and ID.
+pub fn register_deferred_remove_hook(hook: fn(&str, DeviceId)) {
+    DEFERRED_REMOVE_HOOK.call_once(|| hook);
+}
+
 /// Returns the allocated block major ID for device mapper devices, if initialized.
 pub fn dm_major() -> Option<MajorId> {
     DM_MAJOR.get().map(|owner| owner.get())
@@ -302,9 +318,11 @@ pub struct MappedDevice {
     event_wq: WaitQueue,
     /// Open count reported to userspace via `DmIoctl::open_count`.
     ///
-    /// Currently no block-layer open/close hook is available, so this
-    /// remains zero until a tracking mechanism is added.
+    /// The count is maintained by the block-layer `open`/`close` hooks.
     open_count: AtomicU32,
+    /// Set by `DM_DEV_REMOVE` with `DM_DEFERRED_REMOVE` while the device is
+    /// busy; the last `close()` then completes the removal.
+    deferred_remove: AtomicBool,
 }
 
 /// Tracks in-flight I/O, the suspend/resume phase, and the queue of bios
@@ -578,6 +596,7 @@ impl MappedDevice {
             event_nr: AtomicU32::new(0),
             event_wq: WaitQueue::new(),
             open_count: AtomicU32::new(0),
+            deferred_remove: AtomicBool::new(false),
         });
 
         aster_block::register(device.clone()).map_err(|_| DmError::AlreadyRegistered)?;
@@ -789,6 +808,19 @@ impl MappedDevice {
         self.open_count.load(Ordering::Acquire)
     }
 
+    /// Marks the device for deferred removal.
+    ///
+    /// Used by `DM_DEV_REMOVE` with `DM_DEFERRED_REMOVE` when the device is
+    /// busy: the removal is completed by the last `close()`.
+    pub fn mark_deferred_remove(&self) {
+        self.deferred_remove.store(true, Ordering::Release);
+    }
+
+    /// Returns whether a deferred removal is pending.
+    pub fn is_deferred_remove_pending(&self) -> bool {
+        self.deferred_remove.load(Ordering::Acquire)
+    }
+
     /// Returns the number of bios currently in flight.
     #[cfg(ktest)]
     pub(crate) fn in_flight(&self) -> usize {
@@ -979,6 +1011,38 @@ impl MappedDevice {
     pub fn fail_deferred_bios(&self) {
         self.io.fail_deferred();
     }
+
+    /// Completes a deferred removal registered by `DM_DEV_REMOVE` with
+    /// `DM_DEFERRED_REMOVE`.
+    ///
+    /// Called by `close()` when the open count reaches zero while the
+    /// deferred-remove flag is set. Performs the same teardown as an
+    /// immediate `DM_DEV_REMOVE`: unregisters the device from the DM and
+    /// block registries (recycling the minor), bumps the event number so
+    /// `DM_DEV_WAIT` sleepers wake up, fails any deferred bios, and invokes
+    /// the registered hook (devtmpfs node cleanup).
+    fn remove_deferred(&self) {
+        let name = self.name();
+        match manager().remove(&name) {
+            Ok(removed) => {
+                removed.bump_event_nr();
+                removed.fail_deferred_bios();
+                if let Some(hook) = DEFERRED_REMOVE_HOOK.get() {
+                    hook(&name, removed.device_id());
+                }
+            }
+            Err(_) => {
+                // The device is still busy at the block layer (e.g. a
+                // nested DM target holds a lease on it). Restore the flag
+                // so that a later `DM_DEV_REMOVE` completes the removal.
+                self.deferred_remove.store(true, Ordering::Release);
+                ostd::warn!(
+                    "deferred remove of '{}' could not complete yet; device kept",
+                    name
+                );
+            }
+        }
+    }
 }
 
 impl BlockDevice for MappedDevice {
@@ -1040,11 +1104,21 @@ impl BlockDevice for MappedDevice {
     fn close(&self) {
         // Guard against an unbalanced close wrapping the counter to
         // `u32::MAX`; a saturating decrement keeps the count at zero.
-        let _ = self
+        let Ok(prev) = self
             .open_count
             .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_sub(1)
-            });
+            })
+        else {
+            return;
+        };
+        // The last close with a deferred removal pending completes the
+        // removal now, synchronously in the closer's context (no workqueue
+        // is needed). The flag is cleared first so that the removal runs at
+        // most once; it is restored if the device turns out to be busy.
+        if prev == 1 && self.deferred_remove.swap(false, Ordering::AcqRel) {
+            self.remove_deferred();
+        }
     }
 }
 

@@ -258,6 +258,13 @@ fn remove_dev_node(name: &str, id: DeviceId) {
 pub(super) fn init() {
     let device = DmControlDevice::new();
     char::register(device).expect("failed to register dm control device");
+    // Deferred removals (`DM_DEFERRED_REMOVE`) complete inside the aster_dm
+    // crate when the last close happens; register the hook that cleans up
+    // the devtmpfs nodes from here.
+    aster_dm::register_deferred_remove_hook(|name, id| {
+        remove_dev_node(name, id);
+        ostd::info!("removed deferred dm device '{}' (id={:?})", name, id);
+    });
     ostd::info!(
         "device mapper control device registered at /dev/mapper/control ({}:{})",
         DM_CTRL_MAJOR.get(),
@@ -785,15 +792,9 @@ fn handle_dev_remove(header: &mut DmIoctl) -> Result<()> {
         return_errno_with_message!(Errno::EOPNOTSUPP, "secure data erase is not supported");
     }
     // `DM_DEFERRED_REMOVE` schedules the device for removal once it becomes
-    // idle (closed by all users). Asterinas has no deferred-remove workqueue,
-    // so we reject the flag explicitly rather than silently accepting it and
-    // leaving the caller waiting for a removal that never happens.
-    if (header.flags & DM_DEFERRED_REMOVE) != 0 {
-        return_errno_with_message!(
-            Errno::EOPNOTSUPP,
-            "deferred remove is not supported"
-        );
-    }
+    // idle: if the device is busy, the request only registers the removal
+    // and the last `close()` completes it (see `MappedDevice::close`).
+    let deferred = (header.flags & DM_DEFERRED_REMOVE) != 0;
     // Use the shared lookup so UUID-based removal (used by LVM2) also works.
     let device = lookup_device(header)
         .ok_or_else(|| Error::with_message(Errno::ENXIO, "device not found"))?;
@@ -805,6 +806,13 @@ fn handle_dev_remove(header: &mut DmIoctl) -> Result<()> {
     // underlying leases but not userspace opens; the open count (maintained
     // by the BlockDevice::open/close hooks, see P1-2) covers that gap.
     if device.open_count() > 0 {
+        if deferred {
+            // Register the deferred removal and report success, matching
+            // Linux. The device stays fully visible (DM_LIST_DEVICES,
+            // devtmpfs nodes) until the last close completes the removal.
+            device.mark_deferred_remove();
+            return Ok(());
+        }
         return_errno_with_message!(Errno::EBUSY, "device is open and cannot be removed");
     }
 
@@ -824,6 +832,14 @@ fn handle_dev_remove(header: &mut DmIoctl) -> Result<()> {
             removed.fail_deferred_bios();
             remove_dev_node(&name, id);
             ostd::info!("removed dm device '{}' (id={:?})", name, id);
+            Ok(())
+        }
+        Err(aster_dm::DmError::DeviceBusy) if deferred => {
+            // The block layer reports the device busy (e.g. a nested DM
+            // target holds a lease on it) even though no userspace opens
+            // remain. Register the deferred removal, matching Linux; a
+            // later close or explicit `DM_DEV_REMOVE` completes it.
+            device.mark_deferred_remove();
             Ok(())
         }
         Err(aster_dm::DmError::DeviceBusy) => {
