@@ -26,7 +26,7 @@ use ostd::{
 };
 
 use crate::{
-    DmTable, DmTarget, MappedDevice, TableError,
+    DmError, DmTable, DmTarget, MappedDevice, TableError,
     targets::{linear::LinearTarget, striped::StripedTarget, verity::VerityTarget},
 };
 
@@ -3513,4 +3513,111 @@ fn cross_mapper_concurrent_io_to_shared_backing() {
         pattern_b_check,
         "shared [128,256) should hold mapper_b's pattern"
     );
+}
+
+// ===========================================================================
+// Lease/busy removal path and minor pool boundary tests — added 2026-09-16
+// per dm-optimization-plan.md section 2.3.
+// ===========================================================================
+
+/// Test: while a stacked DM device's target holds a block-layer lease on an
+/// inner DM device, removing the inner device fails with
+/// `DmError::DeviceBusy` and the device stays registered. Once the holder is
+/// removed (dropping its table and thus the lease), the removal succeeds.
+#[ktest]
+fn remove_fails_busy_while_target_holds_lease() {
+    ensure_initialized();
+
+    let mock = MockBlockDevice::new("mock-lease", 64);
+    let mut inner_table = DmTable::new();
+    inner_table
+        .add_target(0, 64, DmTarget::Linear(LinearTarget::new(mock, 0)))
+        .unwrap();
+    let inner = MappedDevice::create("dm-lease-inner", inner_table).unwrap();
+
+    // Stack an outer DM device on top of the inner one. The outer device's
+    // linear target acquires a lease on the inner device via
+    // `aster_block::lookup_lease`.
+    let mut outer_table = DmTable::new();
+    outer_table
+        .add_target(
+            0,
+            64,
+            DmTarget::Linear(LinearTarget::new(inner.clone(), 0)),
+        )
+        .unwrap();
+    let outer = MappedDevice::create("dm-lease-outer", outer_table).unwrap();
+
+    // The outstanding lease makes the block layer report the inner device
+    // busy; the manager must keep it registered and manageable.
+    assert!(
+        matches!(
+            MappedDevice::remove_by_name("dm-lease-inner"),
+            Err(DmError::DeviceBusy)
+        ),
+        "remove must fail with DeviceBusy while a lease is outstanding"
+    );
+    assert!(
+        MappedDevice::lookup_by_name("dm-lease-inner").is_some(),
+        "a busy device must stay registered after a failed removal"
+    );
+
+    // Removing the outer device drops its table and the lease; the inner
+    // device can then be removed.
+    drop(MappedDevice::remove_by_name("dm-lease-outer").unwrap());
+    drop(outer);
+    MappedDevice::remove_by_name("dm-lease-inner").unwrap();
+    assert!(MappedDevice::lookup_by_name("dm-lease-inner").is_none());
+    assert!(aster_block::lookup(inner.device_id()).is_none());
+}
+
+/// Test: the minor pool reports `MinorExhausted` when drained, `MinorBusy`
+/// for an explicit in-use minor, and a removed device's minor is recycled
+/// via the `MinorGuard` RAII drop.
+///
+/// Uses a test-only `DmManager` with a two-entry minor pool so exhaustion
+/// can be exercised without creating `MinorId::MAX + 1` devices.
+#[ktest]
+fn minor_exhaustion_and_recycling() {
+    ensure_initialized();
+
+    let major =
+        aster_block::allocate_major_with_name("dm-ktest-minor").expect("allocate a test major");
+    let manager = crate::manager::DmManager::with_minor_capacity(Arc::new(major), 2);
+
+    let dev0 = manager.create("dm-min-0", None::<Arc<str>>, None).unwrap();
+    let dev1 = manager.create("dm-min-1", None::<Arc<str>>, None).unwrap();
+    assert_eq!(dev0.device_id().minor().get(), 0);
+    assert_eq!(dev1.device_id().minor().get(), 1);
+
+    // Pool drained: automatic allocation reports exhaustion.
+    assert!(
+        matches!(
+            manager.create("dm-min-2", None::<Arc<str>>, None),
+            Err(DmError::MinorExhausted)
+        ),
+        "a drained minor pool must report MinorExhausted"
+    );
+    // Explicit allocation of an in-use minor reports MinorBusy.
+    assert!(
+        matches!(
+            manager.create("dm-min-busy", None::<Arc<str>>, Some(0)),
+            Err(DmError::MinorBusy)
+        ),
+        "an in-use explicit minor must report MinorBusy"
+    );
+
+    // Removing a device recycles its minor via the MinorGuard.
+    manager.remove("dm-min-0").unwrap();
+    let dev2 = manager
+        .create("dm-min-2", None::<Arc<str>>, None)
+        .expect("the freed minor must be recyclable");
+    assert_eq!(dev2.device_id().minor().get(), 0);
+
+    // Cleanup.
+    manager.remove("dm-min-1").unwrap();
+    manager.remove("dm-min-2").unwrap();
+    drop(dev0);
+    drop(dev1);
+    drop(dev2);
 }

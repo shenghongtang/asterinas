@@ -121,6 +121,20 @@ impl DmManager {
         }
     }
 
+    /// Creates a new `DmManager` with a limited minor pool capacity.
+    ///
+    /// Test-only constructor that allows exercising minor exhaustion and
+    /// recycling without allocating `MinorId::MAX + 1` devices.
+    #[cfg(ktest)]
+    pub fn with_minor_capacity(major: Arc<MajorIdOwner>, capacity: usize) -> Self {
+        Self {
+            major,
+            minors: Arc::new(Mutex::new(IdAlloc::with_capacity(capacity))),
+            inner: RwLock::new(Registry::new()),
+            guards: Mutex::new(BTreeMap::new()),
+        }
+    }
+
     /// Returns the block major number used by this manager.
     pub fn major(&self) -> device_id::MajorId {
         self.major.get()
