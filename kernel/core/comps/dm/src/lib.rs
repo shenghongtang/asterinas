@@ -271,6 +271,13 @@ pub enum DmError {
     InvalidTable(TableError),
     /// The target parameters are invalid.
     InvalidParameters(&'static str),
+    /// The target type name is not supported by this kernel.
+    UnsupportedTarget,
+    /// A target's parameters or geometry are invalid.
+    Table(&'static str),
+    /// A backing device named in a target specification could not be
+    /// resolved (unknown name or malformed device id).
+    ResolveBacking(&'static str),
 }
 
 /// A virtual block device backed by a device mapper table.

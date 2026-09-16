@@ -33,10 +33,16 @@ pub fn parse_target(target_type: &str, params: &str, len_sectors: u64) -> Result
 
 /// Maps a device-mapper component error to a kernel [`Error`].
 ///
-/// `DmError::NotFound` becomes `ENOENT` (the referenced device does not exist),
-/// while invalid parameters or malformed tables become `EINVAL`.
+/// `DmError::NotFound`/`DmError::ResolveBacking` become `ENOENT` (the
+/// referenced backing device does not exist), while unsupported target
+/// types, invalid parameters, or malformed tables become `EINVAL`.
 fn map_dm_error(err: DmError) -> Error {
     match err {
+        DmError::UnsupportedTarget => {
+            Error::with_message(Errno::EINVAL, "unsupported device mapper target type")
+        }
+        DmError::Table(msg) => Error::with_message(Errno::EINVAL, msg),
+        DmError::ResolveBacking(msg) => Error::with_message(Errno::ENOENT, msg),
         DmError::InvalidParameters(msg) => Error::with_message(Errno::EINVAL, msg),
         DmError::InvalidTable(_) => {
             Error::with_message(Errno::EINVAL, "invalid device mapper table")

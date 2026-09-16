@@ -3621,3 +3621,147 @@ fn minor_exhaustion_and_recycling() {
     drop(dev1);
     drop(dev2);
 }
+
+// ===========================================================================
+// Parser error classification and side-effect ordering tests
+//
+// `parse_target` classifies failures into three categories
+// (`UnsupportedTarget` / `Table` / `ResolveBacking`) and is two-phase: all
+// tokens are parsed and validated before any lease is taken on a backing
+// device, so a failed parse has no observable side effects.
+// ===========================================================================
+
+/// Classifies a [`DmError`] into the parser's three error categories.
+#[derive(Debug, PartialEq, Eq)]
+enum ErrClass {
+    UnsupportedTarget,
+    Table,
+    ResolveBacking,
+}
+
+fn err_class(err: &DmError) -> ErrClass {
+    match err {
+        DmError::UnsupportedTarget => ErrClass::UnsupportedTarget,
+        DmError::Table(_) => ErrClass::Table,
+        DmError::ResolveBacking(_) => ErrClass::ResolveBacking,
+        other => panic!("unexpected error class: {:?}", other),
+    }
+}
+
+/// Test: the parser rejects malformed target specifications with the
+/// classified error of the matching category.
+#[ktest]
+fn parser_classifies_errors() {
+    ensure_initialized();
+    let mock = MockBlockDevice::new("mock-parse-cls", 256);
+    register_mock(&mock);
+
+    // Sanity: a valid single-stripe striped spec must parse.
+    assert!(
+        crate::parse_target("striped", &["1", "8", "mock-parse-cls", "0"], 256).is_ok(),
+        "a valid striped spec must parse"
+    );
+
+    let cases: &[(&str, &[&str], u64, ErrClass)] = &[
+        // Unknown target type.
+        (
+            "raid5",
+            &["1", "8", "mock-parse-cls", "0"],
+            256,
+            ErrClass::UnsupportedTarget,
+        ),
+        // striped: fewer device/start pairs than the stripe count.
+        ("striped", &["8", "1", "mock-parse-cls", "0"], 256, ErrClass::Table),
+        // striped: zero stripes.
+        ("striped", &["0", "8", "mock-parse-cls", "0"], 256, ErrClass::Table),
+        // striped: non-numeric stripe count.
+        ("striped", &["x", "8", "mock-parse-cls", "0"], 256, ErrClass::Table),
+        // striped: zero stripe size.
+        ("striped", &["1", "0", "mock-parse-cls", "0"], 256, ErrClass::Table),
+        // striped: stripe size is not a power of two.
+        ("striped", &["1", "3", "mock-parse-cls", "0"], 256, ErrClass::Table),
+        // striped: non-numeric stripe size.
+        ("striped", &["1", "x", "mock-parse-cls", "0"], 256, ErrClass::Table),
+        // striped: non-numeric start sector.
+        ("striped", &["1", "8", "mock-parse-cls", "x"], 256, ErrClass::Table),
+        // striped: the geometry computation overflows.
+        (
+            "striped",
+            &["1", "8", "mock-parse-cls", "18446744073709551615"],
+            256,
+            ErrClass::Table,
+        ),
+        // striped: the mapping extends past the end of the backing device.
+        ("striped", &["1", "8", "mock-parse-cls", "128"], 256, ErrClass::Table),
+        // striped: unknown backing device name.
+        ("striped", &["1", "8", "no-such-dev", "0"], 256, ErrClass::ResolveBacking),
+        // striped: unknown backing device in `major:minor` form.
+        (
+            "striped",
+            &["1", "8", "249:65535", "0"],
+            256,
+            ErrClass::ResolveBacking,
+        ),
+        // linear: wrong argument count.
+        ("linear", &["mock-parse-cls"], 256, ErrClass::Table),
+        // linear: non-numeric start sector.
+        ("linear", &["mock-parse-cls", "x"], 256, ErrClass::Table),
+        // linear: the mapping extends past the end of the backing device.
+        ("linear", &["mock-parse-cls", "256"], 1, ErrClass::Table),
+        // linear: unknown backing device.
+        ("linear", &["no-such-dev", "0"], 256, ErrClass::ResolveBacking),
+        // zero / error: unexpected parameters.
+        ("zero", &["junk"], 256, ErrClass::Table),
+        ("error", &["junk"], 256, ErrClass::Table),
+    ];
+    for (index, (target_type, args, len_sectors, want)) in cases.iter().enumerate() {
+        let err = crate::parse_target(target_type, args, *len_sectors)
+            .expect_err("every matrix case must fail to parse");
+        assert_eq!(err_class(&err), *want, "matrix case {}", index);
+    }
+}
+
+/// Test: a failed parse takes no lease on the backing device.
+///
+/// Parsing is two-phase: all tokens are parsed and validated first, and
+/// leases are only acquired afterwards (when the target is constructed).
+/// Therefore a validation failure must leave no side effects behind; if a
+/// lease leaked, the block layer would report the device as busy here.
+#[ktest]
+fn failed_parse_takes_no_lease_on_backing() {
+    ensure_initialized();
+    let mock = MockBlockDevice::new("mock-no-lease", 256);
+    register_mock(&mock);
+
+    // Geometry invalid: the mapping extends past the end of the backing
+    // device, so parsing must fail *before* any lease is acquired.
+    let err = crate::parse_target("striped", &["1", "8", "mock-no-lease", "128"], 256)
+        .expect_err("the oversized striped mapping must be rejected");
+    assert!(matches!(err, DmError::Table(_)));
+    let err = crate::parse_target("linear", &["mock-no-lease", "256"], 1)
+        .expect_err("the oversized linear mapping must be rejected");
+    assert!(matches!(err, DmError::Table(_)));
+
+    // Would fail with `Busy` if a failed parse had leaked a lease.
+    aster_block::unregister(mock.id()).expect("a failed parse must not hold a lease");
+}
+
+/// Test: the `dm_mod.create=` boot path shares the runtime parser, so
+/// invalid striped parameters are rejected there with the same classified
+/// errors (static configuration regression).
+#[ktest]
+fn boot_create_arg_rejects_invalid_striped_params() {
+    ensure_initialized();
+    let mock = MockBlockDevice::new("mock-boot-cls", 256);
+    register_mock(&mock);
+
+    // A stripe size that is not a power of two.
+    let err = crate::parser::parse_create_arg("dm-boot-bad: 0 256 striped 1 3 mock-boot-cls 0", 0)
+        .expect_err("a non-power-of-two stripe size must be rejected");
+    assert!(matches!(err, DmError::Table(_)));
+
+    // A mapping that extends past the end of the backing device.
+    let err = crate::parser::parse_create_arg("dm-boot-bad: 0 1024 striped 1 8 mock-boot-cls 0", 0)
+        .expect_err("an oversized mapping must be rejected");
+    assert!(matches!(err, DmError::Table(_)));
+}

@@ -163,22 +163,18 @@ pub fn parse_target(
         "striped" => DmTarget::Striped(parse_striped_target(args, len_sectors)?),
         "zero" => {
             if !args.is_empty() {
-                return Err(DmError::InvalidParameters(
-                    "zero target takes no parameters",
-                ));
+                return Err(DmError::Table("zero: target takes no parameters"));
             }
             DmTarget::Zero(ZeroTarget::new(len_sectors))
         }
         "error" => {
             if !args.is_empty() {
-                return Err(DmError::InvalidParameters(
-                    "error target takes no parameters",
-                ));
+                return Err(DmError::Table("error: target takes no parameters"));
             }
             DmTarget::Error(ErrorTarget::new(len_sectors))
         }
         "verity" => DmTarget::Verity(Arc::new(parse_verity_target(args)?)),
-        _ => return Err(DmError::InvalidParameters("unsupported target type")),
+        _ => return Err(DmError::UnsupportedTarget),
     };
     Ok(target)
 }
@@ -200,21 +196,17 @@ fn parse_segment(line: &str) -> Result<(u64, u64, DmTarget), DmError> {
 
 fn parse_linear_target(args: &[&str], len_sectors: u64) -> Result<LinearTarget, DmError> {
     if args.len() != 2 {
-        return Err(DmError::InvalidParameters(
-            "linear target expects <device> <start_sector>",
-        ));
+        return Err(DmError::Table("linear: wrong argument count"));
     }
-    let device = crate::lookup_block_device(args[0])?;
-    let start_sector = parse_u64(Some(args[1]), "linear target start sector")?;
+    let device = crate::lookup_block_device(args[0])
+        .map_err(|_| DmError::ResolveBacking("linear: cannot resolve backing device"))?;
+    let start_sector = parse_u64(Some(args[1]), "linear target start sector")
+        .map_err(|_| DmError::Table("linear: invalid start sector"))?;
     let end_sector = start_sector
         .checked_add(len_sectors)
-        .ok_or(DmError::InvalidParameters(
-            "linear target extends past the end of the underlying device",
-        ))?;
+        .ok_or(DmError::Table("linear: mapping overflows sector space"))?;
     if end_sector > device.metadata().nr_sectors as u64 {
-        return Err(DmError::InvalidParameters(
-            "linear target extends past the end of the underlying device",
-        ));
+        return Err(DmError::Table("linear: offset beyond device"));
     }
     Ok(LinearTarget::new(device, start_sector))
 }
@@ -225,37 +217,36 @@ fn parse_striped_target(args: &[&str], len_sectors: u64) -> Result<StripedTarget
     // A single-stripe striped target is equivalent to linear; multi-stripe
     // targets distribute I/O across the underlying devices (RAID0).
     if args.len() < 4 {
-        return Err(DmError::InvalidParameters(
-            "striped target requires at least <num_stripes> <stripe_size> <dev> <start>",
-        ));
+        return Err(DmError::Table("striped: wrong argument count"));
     }
     let num_stripes: usize = args[0]
         .parse()
-        .map_err(|_| DmError::InvalidParameters("invalid stripe count"))?;
+        .map_err(|_| DmError::Table("striped: invalid stripe count"))?;
     if num_stripes == 0 {
-        return Err(DmError::InvalidParameters("stripe count must be non-zero"));
+        return Err(DmError::Table("striped: stripe count must be non-zero"));
     }
-    let stripe_size = parse_u64(Some(args[1]), "striped stripe size")?;
+    let stripe_size = args[1]
+        .parse::<u64>()
+        .map_err(|_| DmError::Table("striped: invalid stripe size"))?;
     if stripe_size == 0 {
-        return Err(DmError::InvalidParameters(
-            "striped stripe size must be non-zero",
-        ));
+        return Err(DmError::Table("striped: stripe size must be non-zero"));
     }
     if stripe_size.count_ones() != 1 {
-        return Err(DmError::InvalidParameters(
-            "stripe size must be a power of two",
-        ));
+        return Err(DmError::Table("striped: stripe size must be a power of two"));
     }
     if args.len() != 2 + 2 * num_stripes {
-        return Err(DmError::InvalidParameters(
-            "striped target has mismatched device/start pair count",
+        return Err(DmError::Table(
+            "striped: mismatched device/start pair count",
         ));
     }
     let mut stripes = Vec::new();
     let mut idx = 2;
     for _ in 0..num_stripes {
-        let dev = crate::lookup_block_device(args[idx])?;
-        let start = parse_u64(Some(args[idx + 1]), "striped start sector")?;
+        let dev = crate::lookup_block_device(args[idx])
+            .map_err(|_| DmError::ResolveBacking("striped: cannot resolve backing device"))?;
+        let start = args[idx + 1]
+            .parse::<u64>()
+            .map_err(|_| DmError::Table("striped: invalid start sector"))?;
         stripes.push((dev, start));
         idx += 2;
     }
@@ -278,12 +269,12 @@ fn parse_striped_target(args: &[&str], len_sectors: u64) -> Result<StripedTarget
         let end_sector = start
             .checked_add((count - 1) * stripe_size)
             .and_then(|s| s.checked_add(last_stripe_sectors))
-            .ok_or(DmError::InvalidParameters(
-                "striped target extends past the end of an underlying device",
+            .ok_or(DmError::Table(
+                "striped: target extends past the end of an underlying device",
             ))?;
         if end_sector > dev.metadata().nr_sectors as u64 {
-            return Err(DmError::InvalidParameters(
-                "striped target extends past the end of an underlying device",
+            return Err(DmError::Table(
+                "striped: target extends past the end of an underlying device",
             ));
         }
     }
