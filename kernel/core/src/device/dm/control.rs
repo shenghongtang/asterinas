@@ -844,7 +844,9 @@ fn handle_dev_remove(header: &mut DmIoctl) -> Result<()> {
 
     ostd::error!(
         "DM_DEV_REMOVE: name={}, deferred={}, open_count={}",
-        name, deferred, device.open_count()
+        name,
+        deferred,
+        device.open_count()
     );
 
     // Refuse to remove a device that still has open file descriptors. The
