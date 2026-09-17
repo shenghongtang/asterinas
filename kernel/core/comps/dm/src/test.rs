@@ -1498,11 +1498,7 @@ fn zero_read_returns_zeros() {
 
     let mut table = DmTable::new();
     table
-        .add_target(
-            0,
-            8,
-            DmTarget::Zero(crate::targets::zero::ZeroTarget::new(8)),
-        )
+        .add_target(0, 8, DmTarget::Zero(ZeroTarget::new(8)))
         .unwrap();
     let mapped = MappedDevice::create("dm-zero-0", table).unwrap();
 
@@ -1521,11 +1517,7 @@ fn zero_write_succeeds() {
 
     let mut table = DmTable::new();
     table
-        .add_target(
-            0,
-            8,
-            DmTarget::Zero(crate::targets::zero::ZeroTarget::new(8)),
-        )
+        .add_target(0, 8, DmTarget::Zero(ZeroTarget::new(8)))
         .unwrap();
     let mapped = MappedDevice::create("dm-zero-1", table).unwrap();
 
@@ -1554,11 +1546,7 @@ fn error_read_fails() {
 
     let mut table = DmTable::new();
     table
-        .add_target(
-            0,
-            8,
-            DmTarget::Error(crate::targets::error::ErrorTarget::new(8)),
-        )
+        .add_target(0, 8, DmTarget::Error(ErrorTarget::new(8)))
         .unwrap();
     let mapped = MappedDevice::create("dm-error-0", table).unwrap();
 
@@ -1579,11 +1567,7 @@ fn error_write_fails() {
 
     let mut table = DmTable::new();
     table
-        .add_target(
-            0,
-            8,
-            DmTarget::Error(crate::targets::error::ErrorTarget::new(8)),
-        )
+        .add_target(0, 8, DmTarget::Error(ErrorTarget::new(8)))
         .unwrap();
     let mapped = MappedDevice::create("dm-error-1", table).unwrap();
 
@@ -2024,8 +2008,16 @@ fn enqueue_error_keeps_in_flight_balanced() {
     assert_eq!(mapped.deferred_len(), 1);
     assert_eq!(mapped.in_flight(), 0, "deferred bio must not be in-flight");
     mapped.set_suspended(false);
-    assert_eq!(mapped.deferred_len(), 0, "deferred bio must be replayed on resume");
-    assert_eq!(mapped.in_flight(), 0, "replayed bio that fails must balance the counter");
+    assert_eq!(
+        mapped.deferred_len(),
+        0,
+        "deferred bio must be replayed on resume"
+    );
+    assert_eq!(
+        mapped.in_flight(),
+        0,
+        "replayed bio that fails must balance the counter"
+    );
 }
 
 /// Test: `rename_by_name` updates the registry so the old name is not found
@@ -3426,18 +3418,10 @@ fn find_target_binary_search_boundaries() {
         .add_target(0, 8, DmTarget::Linear(LinearTarget::new(mock.clone(), 0)))
         .unwrap();
     table
-        .add_target(
-            8,
-            8,
-            DmTarget::Zero(crate::targets::zero::ZeroTarget::new(8)),
-        )
+        .add_target(8, 8, DmTarget::Zero(ZeroTarget::new(8)))
         .unwrap();
     table
-        .add_target(
-            16,
-            8,
-            DmTarget::Error(crate::targets::error::ErrorTarget::new(8)),
-        )
+        .add_target(16, 8, DmTarget::Error(ErrorTarget::new(8)))
         .unwrap();
 
     // First target: start and last-sector-before-boundary.
@@ -3476,11 +3460,7 @@ fn add_target_rejects_invalid_tables() {
         .add_target(0, 8, DmTarget::Linear(LinearTarget::new(mock.clone(), 0)))
         .unwrap();
     assert!(matches!(
-        table.add_target(
-            100,
-            8,
-            DmTarget::Zero(crate::targets::zero::ZeroTarget::new(8))
-        ),
+        table.add_target(100, 8, DmTarget::Zero(ZeroTarget::new(8))),
         Err(TableError::NotContiguous)
     ));
 
@@ -3527,7 +3507,11 @@ fn postponed_bio_replays_against_new_table_after_resume() {
 
     let mut table_a = DmTable::new();
     table_a
-        .add_target(0, 256, DmTarget::Linear(LinearTarget::new(mock_a.clone(), 0)))
+        .add_target(
+            0,
+            256,
+            DmTarget::Linear(LinearTarget::new(mock_a.clone(), 0)),
+        )
         .unwrap();
     let mapped = MappedDevice::create("dm-post-0", table_a).unwrap();
 
@@ -3538,7 +3522,11 @@ fn postponed_bio_replays_against_new_table_after_resume() {
     // Load a new inactive table pointing to mock_b.
     let mut table_b = DmTable::new();
     table_b
-        .add_target(0, 256, DmTarget::Linear(LinearTarget::new(mock_b.clone(), 0)))
+        .add_target(
+            0,
+            256,
+            DmTarget::Linear(LinearTarget::new(mock_b.clone(), 0)),
+        )
         .unwrap();
     mapped.load_table(table_b).unwrap();
 
@@ -3603,10 +3591,18 @@ fn split_bio_completes_regardless_of_child_order() {
     let mock_b = DeferredBlockDevice::new("mock-split-b", 128);
     let mut table = DmTable::new();
     table
-        .add_target(0, 128, DmTarget::Linear(LinearTarget::new(mock_a.clone(), 0)))
+        .add_target(
+            0,
+            128,
+            DmTarget::Linear(LinearTarget::new(mock_a.clone(), 0)),
+        )
         .unwrap();
     table
-        .add_target(128, 128, DmTarget::Linear(LinearTarget::new(mock_b.clone(), 0)))
+        .add_target(
+            128,
+            128,
+            DmTarget::Linear(LinearTarget::new(mock_b.clone(), 0)),
+        )
         .unwrap();
     let mapped = MappedDevice::create("dm-split-ord", table).unwrap();
 
@@ -3661,7 +3657,11 @@ fn split_bio_propagates_child_failure_to_parent() {
     let mock_bad = RefusingBlockDevice::new("mock-fail-bad", 128);
     let mut table = DmTable::new();
     table
-        .add_target(0, 128, DmTarget::Linear(LinearTarget::new(mock_ok.clone(), 0)))
+        .add_target(
+            0,
+            128,
+            DmTarget::Linear(LinearTarget::new(mock_ok.clone(), 0)),
+        )
         .unwrap();
     table
         .add_target(128, 128, DmTarget::Linear(LinearTarget::new(mock_bad, 0)))
@@ -3716,14 +3716,22 @@ fn cross_mapper_concurrent_io_to_shared_backing() {
     // mapper_a: [0,128) -> shared [0,128)
     let mut table_a = DmTable::new();
     table_a
-        .add_target(0, 128, DmTarget::Linear(LinearTarget::new(shared.clone(), 0)))
+        .add_target(
+            0,
+            128,
+            DmTarget::Linear(LinearTarget::new(shared.clone(), 0)),
+        )
         .unwrap();
     let mapper_a = MappedDevice::create("dm-cross-a", table_a).unwrap();
 
     // mapper_b: [0,128) -> shared [128,256)
     let mut table_b = DmTable::new();
     table_b
-        .add_target(0, 128, DmTarget::Linear(LinearTarget::new(shared.clone(), 128)))
+        .add_target(
+            0,
+            128,
+            DmTarget::Linear(LinearTarget::new(shared.clone(), 128)),
+        )
         .unwrap();
     let mapper_b = MappedDevice::create("dm-cross-b", table_b).unwrap();
 
@@ -3834,11 +3842,7 @@ fn remove_fails_busy_while_target_holds_lease() {
     // `aster_block::lookup_lease`.
     let mut outer_table = DmTable::new();
     outer_table
-        .add_target(
-            0,
-            64,
-            DmTarget::Linear(LinearTarget::new(inner.clone(), 0)),
-        )
+        .add_target(0, 64, DmTarget::Linear(LinearTarget::new(inner.clone(), 0)))
         .unwrap();
     let outer = MappedDevice::create("dm-lease-outer", outer_table).unwrap();
 
@@ -3965,19 +3969,54 @@ fn parser_classifies_errors() {
             ErrClass::UnsupportedTarget,
         ),
         // striped: fewer device/start pairs than the stripe count.
-        ("striped", &["8", "1", "mock-parse-cls", "0"], 256, ErrClass::Table),
+        (
+            "striped",
+            &["8", "1", "mock-parse-cls", "0"],
+            256,
+            ErrClass::Table,
+        ),
         // striped: zero stripes.
-        ("striped", &["0", "8", "mock-parse-cls", "0"], 256, ErrClass::Table),
+        (
+            "striped",
+            &["0", "8", "mock-parse-cls", "0"],
+            256,
+            ErrClass::Table,
+        ),
         // striped: non-numeric stripe count.
-        ("striped", &["x", "8", "mock-parse-cls", "0"], 256, ErrClass::Table),
+        (
+            "striped",
+            &["x", "8", "mock-parse-cls", "0"],
+            256,
+            ErrClass::Table,
+        ),
         // striped: zero stripe size.
-        ("striped", &["1", "0", "mock-parse-cls", "0"], 256, ErrClass::Table),
+        (
+            "striped",
+            &["1", "0", "mock-parse-cls", "0"],
+            256,
+            ErrClass::Table,
+        ),
         // striped: stripe size is not a power of two.
-        ("striped", &["1", "3", "mock-parse-cls", "0"], 256, ErrClass::Table),
+        (
+            "striped",
+            &["1", "3", "mock-parse-cls", "0"],
+            256,
+            ErrClass::Table,
+        ),
         // striped: non-numeric stripe size.
-        ("striped", &["1", "x", "mock-parse-cls", "0"], 256, ErrClass::Table),
+        (
+            "striped",
+            &["1", "x", "mock-parse-cls", "0"],
+            256,
+            ErrClass::Table,
+        ),
         // striped: non-numeric start sector.
-        ("striped", &["1", "8", "mock-parse-cls", "x"], 256, ErrClass::Table),
+        (
+            "striped",
+            &["1", "8", "mock-parse-cls", "x"],
+            256,
+            ErrClass::Table,
+        ),
         // striped: the geometry computation overflows.
         (
             "striped",
@@ -3986,9 +4025,19 @@ fn parser_classifies_errors() {
             ErrClass::Table,
         ),
         // striped: the mapping extends past the end of the backing device.
-        ("striped", &["1", "8", "mock-parse-cls", "128"], 256, ErrClass::Table),
+        (
+            "striped",
+            &["1", "8", "mock-parse-cls", "128"],
+            256,
+            ErrClass::Table,
+        ),
         // striped: unknown backing device name.
-        ("striped", &["1", "8", "no-such-dev", "0"], 256, ErrClass::ResolveBacking),
+        (
+            "striped",
+            &["1", "8", "no-such-dev", "0"],
+            256,
+            ErrClass::ResolveBacking,
+        ),
         // striped: unknown backing device in `major:minor` form.
         (
             "striped",
@@ -4003,7 +4052,12 @@ fn parser_classifies_errors() {
         // linear: the mapping extends past the end of the backing device.
         ("linear", &["mock-parse-cls", "256"], 1, ErrClass::Table),
         // linear: unknown backing device.
-        ("linear", &["no-such-dev", "0"], 256, ErrClass::ResolveBacking),
+        (
+            "linear",
+            &["no-such-dev", "0"],
+            256,
+            ErrClass::ResolveBacking,
+        ),
         // zero / error: unexpected parameters.
         ("zero", &["junk"], 256, ErrClass::Table),
         ("error", &["junk"], 256, ErrClass::Table),

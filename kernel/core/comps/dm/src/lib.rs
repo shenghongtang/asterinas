@@ -54,10 +54,7 @@
 
 extern crate alloc;
 
-use alloc::{
-    collections::VecDeque,
-    format, string::String, sync::Arc, vec::Vec,
-};
+use alloc::{collections::VecDeque, format, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use aster_block::{

@@ -443,7 +443,7 @@ fn check_data_area(header: &DmIoctl) -> Result<()> {
     if ds < size_of::<DmIoctl>() || ds > header.data_size as usize {
         return_errno_with_message!(Errno::EINVAL, "invalid data area description");
     }
-    if header.data_start % 8 != 0 {
+    if !header.data_start.is_multiple_of(8) {
         return_errno_with_message!(Errno::EINVAL, "data_start must be 8-byte aligned");
     }
     if header.data_size as usize > DM_MAX_DATA_SIZE {

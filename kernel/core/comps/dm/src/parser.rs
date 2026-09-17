@@ -234,7 +234,9 @@ fn parse_striped_target(args: &[&str], len_sectors: u64) -> Result<StripedTarget
         return Err(DmError::Table("striped: stripe size must be non-zero"));
     }
     if stripe_size.count_ones() != 1 {
-        return Err(DmError::Table("striped: stripe size must be a power of two"));
+        return Err(DmError::Table(
+            "striped: stripe size must be a power of two",
+        ));
     }
     if args.len() != 2 + 2 * num_stripes {
         return Err(DmError::Table(
