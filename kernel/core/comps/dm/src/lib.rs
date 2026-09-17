@@ -377,7 +377,13 @@ const PHASE_SUSPENDED: u32 = 2 << PHASE_SHIFT;
 impl DmIoState {
     fn new() -> Self {
         Self {
-            state: AtomicU32::new(0),
+            // Start in the Suspended phase, matching Linux's behavior where
+            // newly created DM devices are suspended until an explicit resume
+            // (DM_DEV_SUSPEND without DM_SUSPEND_FLAG). This causes the
+            // DM_DEV_CREATE response to include DM_SUSPEND_FLAG, which makes
+            // libdevmapper increment its `_suspended_dev_counter`, ensuring
+            // the subsequent resume ioctl is actually sent rather than skipped.
+            state: AtomicU32::new(PHASE_SUSPENDED),
             drained: WaitQueue::new(),
             deferred: spin::Mutex::new(VecDeque::new()),
             freeing: AtomicBool::new(false),
@@ -476,6 +482,24 @@ impl DmIoState {
         loop {
             let cur = self.state.load(Ordering::Acquire);
             let new = cur & IN_FLIGHT_MASK;
+            if self
+                .state
+                .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Forcefully sets the device to the Suspended phase, bypassing the
+    /// normal Running→Suspending→Suspended transition. Used by `reset()`
+    /// to restore a freshly-created device state without the assertion
+    /// guards of `mark_suspending`/`mark_suspended`.
+    fn force_suspended(&self) {
+        loop {
+            let cur = self.state.load(Ordering::Acquire);
+            let new = (cur & IN_FLIGHT_MASK) | PHASE_SUSPENDED;
             if self
                 .state
                 .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
@@ -618,19 +642,12 @@ impl MappedDevice {
     /// Linux's behavior where repeated `DM_TABLE_LOAD` calls replace the
     /// pending inactive table).
     pub fn load_table(&self, table: DmTable) -> Result<(), DmError> {
-        // For a newly created device with no active table, load directly to
-        // active so I/O works immediately. This is necessary because
-        // libdevmapper may skip the resume ioctl (DM_DEV_SUSPEND without
-        // DM_SUSPEND_FLAG) when its internal suspended-device counter is zero,
-        // leaving the table stranded in the inactive slot.
-        let mut active = self.table.lock();
-        if active.is_none() {
-            *active = Some(Arc::new(table));
-        } else {
-            // Active table exists - load to inactive for hot replacement.
-            drop(active);
-            *self.inactive_table.lock() = Some(Arc::new(table));
-        }
+        // Always load to the inactive slot. The table is swapped to the
+        // active slot on resume (DM_DEV_SUSPEND without DM_SUSPEND_FLAG).
+        // This matches Linux's behavior and ensures the resume ioctl is
+        // required for activation, which keeps libdevmapper's
+        // `_suspended_dev_counter` in sync.
+        *self.inactive_table.lock() = Some(Arc::new(table));
         // Note: loading a table does NOT bump the per-device event number.
         // In Linux, `md->event_nr` is incremented only by target-originated
         // events (`dm_table_event`), never by generic control operations.
@@ -779,12 +796,19 @@ impl MappedDevice {
     pub fn reset(&self) {
         *self.table.lock() = None;
         *self.inactive_table.lock() = None;
-        // Fail any bios deferred during a prior suspend; the table is gone
-        // so they cannot be replayed. The phase is cleared implicitly by
-        // fail_deferred setting the freeing flag — new bios arriving after
-        // reset will be submitted against a None table and refused normally.
-        self.io.fail_deferred();
-        self.io.clear_suspended();
+        // Drain and fail any bios deferred during a prior suspend; the table
+        // is gone so they cannot be replayed. Unlike `fail_deferred`, this
+        // does NOT set the `freeing` flag, because `reset` is used to reuse
+        // an existing device (e.g. DM_DEV_CREATE on an AlreadyRegistered
+        // device) — new bios arriving after reset must be deferred normally
+        // (device is in Suspended phase) rather than immediately failed.
+        for bio in self.io.take_deferred() {
+            bio.complete(BioStatus::IoError);
+        }
+        // Return to the Suspended phase, matching Linux's behavior where
+        // a freshly created (or reset) device is suspended until an explicit
+        // resume. This keeps libdevmapper's `_suspended_dev_counter` in sync.
+        self.io.force_suspended();
     }
 
     /// Returns the device name.

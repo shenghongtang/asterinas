@@ -739,11 +739,11 @@ fn handle_dev_create(header: &mut DmIoctl) -> Result<()> {
             // EEXIST - they simply abort the entire operation.
             //
             // Workaround: reset and reuse the existing device. Resetting
-            // clears both active and inactive tables and leaves the device
-            // unsuspended. Because no active table remains after reset,
-            // LVM2's subsequent DM_TABLE_LOAD writes the new table directly
-            // into the active slot, so I/O works even if the resume ioctl
-            // is skipped by libdevmapper's suspended-device counter.
+            // clears both active and inactive tables and returns the device
+            // to the Suspended phase (matching Linux's behavior for newly
+            // created devices). The subsequent DM_TABLE_LOAD loads the new
+            // table into the inactive slot, and the resume ioctl swaps it
+            // to active.
             if let Some(existing) = MappedDevice::lookup_by_name(name.as_ref()) {
                 // Set the UUID before resetting the device. If setting the UUID
                 // fails, the device retains its old tables and suspended state;
@@ -842,6 +842,11 @@ fn handle_dev_remove(header: &mut DmIoctl) -> Result<()> {
     let name = device.name().to_string();
     let id = device.device_id();
 
+    ostd::error!(
+        "DM_DEV_REMOVE: name={}, deferred={}, open_count={}",
+        name, deferred, device.open_count()
+    );
+
     // Refuse to remove a device that still has open file descriptors. The
     // block-layer lease check inside `remove_by_name` catches nested-DM
     // underlying leases but not userspace opens; the open count (maintained
@@ -880,6 +885,10 @@ fn handle_dev_remove(header: &mut DmIoctl) -> Result<()> {
             // target holds a lease on it) even though no userspace opens
             // remain. Register the deferred removal, matching Linux; a
             // later close or explicit `DM_DEV_REMOVE` completes it.
+            ostd::warn!(
+                "DM_DEV_REMOVE: '{}' busy at block layer, marking deferred (open_count=0)",
+                name
+            );
             device.mark_deferred_remove();
             Ok(())
         }

@@ -1947,15 +1947,14 @@ fn reset_clears_tables() {
 
     assert!(mapped.table().is_none());
     assert!(mapped.inactive_table().is_none());
-    assert!(!mapped.is_suspended());
+    // After reset the device returns to the Suspended phase, matching
+    // Linux's behavior where a freshly created device is suspended until
+    // an explicit resume.
+    assert!(mapped.is_suspended());
 
-    // I/O should be refused after reset because no table is loaded.
-    let segment = BioSegment::alloc(1, BioDirection::FromDevice);
-    let bio = Bio::new(BioType::Read, Sid::new(0), vec![segment], None);
-    assert_eq!(
-        bio.submit_and_wait(mapped.as_ref()),
-        Err(BioEnqueueError::Refused),
-    );
+    // After reset the device is suspended with no table, matching Linux's
+    // behavior where a freshly created device is suspended until an explicit
+    // resume. I/O is deferred (not refused) until resume.
 }
 
 /// Test: the in-flight counter stays balanced when the backing device
