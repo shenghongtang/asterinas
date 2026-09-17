@@ -31,7 +31,9 @@
 use alloc::format;
 use core::ops::{Deref, DerefMut};
 
-use aster_dm::{DmTable, MappedDevice, TableError, get_target_version, list_target_versions};
+use aster_dm::{
+    DmTable, MappedDevice, TableError, TargetStatusMode, get_target_version, list_target_versions,
+};
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::mm::VmIo;
 
@@ -1290,10 +1292,11 @@ fn handle_table_deps(header: &mut DmIoctl, arg: usize) -> Result<()> {
 ///
 /// If `DM_QUERY_INACTIVE_TABLE_FLAG` is set in the ioctl flags, the inactive
 /// table (loaded by `DM_TABLE_LOAD` but not yet swapped to active) is returned
-/// instead of the active table. If `DM_STATUS_TABLE_FLAG` is set, the full
-/// table parameters are returned; otherwise only the target type and runtime
-/// status (currently empty for all targets) are returned. This matches Linux's
-/// behavior for `dmsetup table` and `dmsetup status`.
+/// instead of the active table. If `DM_STATUS_TABLE_FLAG` is set, each target
+/// reports its parameters exactly as loaded (`dmsetup table`); otherwise it
+/// reports its runtime status string (`dmsetup status`), e.g. striped reports
+/// `"N major:minor... 1 AAA"`. The status string (possibly empty) is always
+/// emitted after each target spec, matching Linux.
 fn handle_table_status(header: &mut DmIoctl, arg: usize) -> Result<()> {
     let device = lookup_device(header)
         .ok_or_else(|| Error::with_message(Errno::ENXIO, "device not found"))?;
@@ -1318,20 +1321,18 @@ fn handle_table_status(header: &mut DmIoctl, arg: usize) -> Result<()> {
         }
     };
 
-    let infos = table.target_infos();
-    let return_params = header.flags & DM_STATUS_TABLE_FLAG != 0;
+    let mode = if header.flags & DM_STATUS_TABLE_FLAG != 0 {
+        TargetStatusMode::Table
+    } else {
+        TargetStatusMode::Status
+    };
+    let infos = table.target_infos(mode);
 
-    // Compute entry sizes: spec(40) + (params + null if requested), padded to 8.
+    // Compute entry sizes: spec(40) + status string + null, padded to 8.
+    // Linux always emits the (possibly empty) status string.
     let entry_sizes: Vec<usize> = infos
         .iter()
-        .map(|info| {
-            let params_len = if return_params {
-                info.params.len() + 1
-            } else {
-                0
-            };
-            align8(40 + params_len)
-        })
+        .map(|info| align8(40 + info.params.len() + 1))
         .collect();
 
     let total: usize = entry_sizes.iter().sum();
@@ -1356,11 +1357,9 @@ fn handle_table_status(header: &mut DmIoctl, arg: usize) -> Result<()> {
         tt[..tt_len].copy_from_slice(&tt_bytes[..tt_len]);
         writer.extend_from_slice(&tt);
 
-        // Params string (null-terminated) only when returning the table.
-        if return_params {
-            writer.extend_from_slice(info.params.as_bytes());
-            writer.push(0);
-        }
+        // Status string (null-terminated, possibly empty), always emitted.
+        writer.extend_from_slice(info.params.as_bytes());
+        writer.push(0);
 
         writer.end_entry(entry_start);
     }

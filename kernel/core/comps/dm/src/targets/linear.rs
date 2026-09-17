@@ -18,7 +18,7 @@ use aster_block::{
 };
 use device_id::DeviceId;
 
-use crate::target::{DmTargetMetadata, Target};
+use crate::target::{DmTargetMetadata, Target, TargetStatusMode};
 
 /// A linear mapping target.
 ///
@@ -125,8 +125,12 @@ impl Target for LinearTarget {
         self.device.metadata()
     }
 
-    fn params(&self) -> &str {
-        &self.params
+    fn status_params(&self, mode: TargetStatusMode) -> String {
+        match mode {
+            TargetStatusMode::Table => self.params.clone(),
+            // Linux dm-linear reports no runtime status fields.
+            TargetStatusMode::Status => String::new(),
+        }
     }
 
     fn deps(&self) -> &[DeviceId] {

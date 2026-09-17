@@ -7,14 +7,14 @@
 //!
 //! Reference: Linux `Documentation/admin-guide/device-mapper/zero.rst`.
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
 use aster_block::{
     BlockDevice, BlockDeviceMeta,
     bio::{BioEnqueueError, BioStatus, BioType, SubmittedBio},
 };
 
-use crate::target::{DmTargetMetadata, Target};
+use crate::target::{DmTargetMetadata, Target, TargetStatusMode};
 
 /// A `zero` target.
 #[derive(Debug)]
@@ -70,8 +70,9 @@ impl Target for ZeroTarget {
         }
     }
 
-    fn params(&self) -> &str {
-        ""
+    fn status_params(&self, _mode: TargetStatusMode) -> String {
+        // Linux dm-zero reports neither table parameters nor runtime status.
+        String::new()
     }
 
     fn deps(&self) -> &[device_id::DeviceId] {

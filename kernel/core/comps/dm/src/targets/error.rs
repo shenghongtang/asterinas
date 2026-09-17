@@ -8,7 +8,7 @@
 //! Reference: Linux `Documentation/admin-guide/device-mapper/zero.rst`
 //! (the `error` target is documented alongside `zero`).
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
 use aster_block::{
     BlockDevice, BlockDeviceMeta,
@@ -16,7 +16,7 @@ use aster_block::{
 };
 use device_id::DeviceId;
 
-use crate::target::{DmTargetMetadata, Target};
+use crate::target::{DmTargetMetadata, Target, TargetStatusMode};
 
 /// An `error` target.
 #[derive(Debug)]
@@ -54,8 +54,9 @@ impl Target for ErrorTarget {
         }
     }
 
-    fn params(&self) -> &str {
-        ""
+    fn status_params(&self, _mode: TargetStatusMode) -> String {
+        // Linux dm-error reports neither table parameters nor runtime status.
+        String::new()
     }
 
     fn deps(&self) -> &[DeviceId] {

@@ -28,7 +28,7 @@ use smallvec::SmallVec;
 
 use crate::{
     TableError,
-    target::{DmTarget, Target},
+    target::{DmTarget, Target, TargetStatusMode},
 };
 
 /// The maximum number of table-entry-aligned sub-ranges a single bio is
@@ -71,15 +71,16 @@ struct TableEntry {
 
 /// Information about a target in the table, used for `DM_TABLE_STATUS` output.
 #[derive(Debug, Clone)]
-pub struct TargetInfo<'a> {
+pub struct TargetInfo {
     /// The starting logical sector on the mapped device.
     pub sector_start: u64,
     /// The number of sectors covered by this target.
     pub length: u64,
     /// The target type name (e.g., `"linear"`).
     pub target_type: String,
-    /// The target-specific parameters string.
-    pub params: &'a str,
+    /// The target-specific parameters or runtime status string, depending on
+    /// the [`TargetStatusMode`] passed to [`DmTable::target_infos`].
+    pub params: String,
 }
 
 impl DmTable {
@@ -340,14 +341,18 @@ impl DmTable {
     }
 
     /// Returns information about all targets in the table, for `DM_TABLE_STATUS`.
-    pub fn target_infos(&self) -> Vec<TargetInfo<'_>> {
+    ///
+    /// `mode` selects whether each entry's `params` field holds the table
+    /// parameters as loaded (`dmsetup table`) or the runtime status string
+    /// (`dmsetup status`); see [`TargetStatusMode`].
+    pub fn target_infos(&self, mode: TargetStatusMode) -> Vec<TargetInfo> {
         self.entries
             .iter()
             .map(|e| TargetInfo {
                 sector_start: e.logical_start,
                 length: e.num_sectors,
                 target_type: e.target.name().into(),
-                params: e.target.params(),
+                params: e.target.status_params(mode),
             })
             .collect()
     }

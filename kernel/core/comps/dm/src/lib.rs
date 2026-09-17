@@ -99,7 +99,7 @@ mod test;
 
 pub use parser::parse_target;
 pub use table::{DmTable, TargetInfo};
-pub use target::{DmTarget, Target};
+pub use target::{DmTarget, Target, TargetStatusMode};
 pub use targets::{
     error::ErrorTarget, linear::LinearTarget, verity::VerityTarget, zero::ZeroTarget,
 };

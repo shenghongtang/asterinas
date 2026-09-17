@@ -26,7 +26,7 @@ use aster_block::{
 use device_id::DeviceId;
 use smallvec::SmallVec;
 
-use crate::target::{DmTargetMetadata, Target};
+use crate::target::{DmTargetMetadata, Target, TargetStatusMode};
 
 /// Inline capacity for the stripe ranges a single bio is split into.
 ///
@@ -262,8 +262,29 @@ impl Target for StripedTarget {
         self.metadata
     }
 
-    fn params(&self) -> &str {
-        &self.params
+    fn status_params(&self, mode: TargetStatusMode) -> String {
+        match mode {
+            TargetStatusMode::Table => self.params.clone(),
+            // Linux dm-stripe STATUSTYPE_INFO layout:
+            // "<num_stripes> <dev1> <dev2> ... 1 <alive char per stripe>".
+            // There is no failure tracking, so every stripe reports 'A'.
+            TargetStatusMode::Status => {
+                let mut out = alloc::format!("{}", self.stripes.len());
+                for stripe in &self.stripes {
+                    let id = stripe.device.id();
+                    out.push_str(&alloc::format!(
+                        " {}:{}",
+                        id.major().get(),
+                        id.minor().get()
+                    ));
+                }
+                out.push_str(" 1 ");
+                for _ in &self.stripes {
+                    out.push('A');
+                }
+                out
+            }
+        }
     }
 
     fn deps(&self) -> &[DeviceId] {

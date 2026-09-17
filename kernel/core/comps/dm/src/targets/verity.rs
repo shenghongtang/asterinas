@@ -30,7 +30,7 @@ use crate::{
     DmError,
     hash::{self, HashAlgorithm},
     lookup_block_device,
-    target::{DmTargetMetadata, Target},
+    target::{DmTargetMetadata, Target, TargetStatusMode},
 };
 
 /// The number of mandatory arguments in a `verity` table line.
@@ -837,8 +837,15 @@ impl Target for Arc<VerityTarget> {
         }
     }
 
-    fn params(&self) -> &str {
-        &self.params
+    fn status_params(&self, mode: TargetStatusMode) -> String {
+        match mode {
+            TargetStatusMode::Table => self.params.clone(),
+            // Linux reports 'V'/'C' here based on a corruption latch. This
+            // implementation fails closed on corruption but keeps no latch,
+            // so reporting 'V' would fabricate health state; report an empty
+            // status instead.
+            TargetStatusMode::Status => String::new(),
+        }
     }
 
     fn deps(&self) -> &[DeviceId] {

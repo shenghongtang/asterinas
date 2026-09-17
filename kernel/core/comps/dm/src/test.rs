@@ -26,8 +26,11 @@ use ostd::{
 };
 
 use crate::{
-    DmError, DmTable, DmTarget, MappedDevice, TableError,
-    targets::{linear::LinearTarget, striped::StripedTarget, verity::VerityTarget},
+    DmError, DmTable, DmTarget, MappedDevice, TableError, Target, TargetStatusMode,
+    targets::{
+        error::ErrorTarget, linear::LinearTarget, striped::StripedTarget, verity::VerityTarget,
+        zero::ZeroTarget,
+    },
 };
 
 /// A simple in-memory block device for testing.
@@ -3764,4 +3767,101 @@ fn boot_create_arg_rejects_invalid_striped_params() {
     let err = crate::parser::parse_create_arg("dm-boot-bad: 0 1024 striped 1 8 mock-boot-cls 0", 0)
         .expect_err("an oversized mapping must be rejected");
     assert!(matches!(err, DmError::Table(_)));
+}
+
+// ===========================================================================
+// Status output tests (`TargetStatusMode::Table` vs `TargetStatusMode::Status`)
+// ===========================================================================
+
+/// Test: `status_params` distinguishes `dmsetup table` (Table mode) from
+/// `dmsetup status` (Status mode), and striped reports the Linux
+/// STATUSTYPE_INFO layout in Status mode.
+#[ktest]
+fn status_params_table_vs_status_modes() {
+    ensure_initialized();
+
+    let mock_a = MockBlockDevice::new("mock-status-a", 256);
+    let mock_b = MockBlockDevice::new("mock-status-b", 256);
+    let id_a = mock_a.id();
+    let id_b = mock_b.id();
+
+    // Striped, two stripes: Table mode echoes the loaded parameters; Status
+    // mode uses the Linux INFO layout "N dev1 dev2 ... 1 AA".
+    let target = StripedTarget::new(vec![(mock_a.clone(), 16), (mock_b.clone(), 32)], 8);
+    let expected_table = format!(
+        "2 8 {}:{} 16 {}:{} 32",
+        id_a.major().get(),
+        id_a.minor().get(),
+        id_b.major().get(),
+        id_b.minor().get()
+    );
+    assert_eq!(
+        target.status_params(TargetStatusMode::Table),
+        expected_table
+    );
+    let expected_status = format!(
+        "2 {}:{} {}:{} 1 AA",
+        id_a.major().get(),
+        id_a.minor().get(),
+        id_b.major().get(),
+        id_b.minor().get()
+    );
+    assert_eq!(
+        target.status_params(TargetStatusMode::Status),
+        expected_status
+    );
+
+    // Striped, single stripe: "1 dev 1 A".
+    let target = StripedTarget::new(vec![(mock_a.clone(), 0)], 8);
+    let expected_status = format!("1 {}:{} 1 A", id_a.major().get(), id_a.minor().get());
+    assert_eq!(
+        target.status_params(TargetStatusMode::Status),
+        expected_status
+    );
+
+    // Linear: Table mode echoes "major:minor start", Status mode is empty
+    // (Linux dm-linear reports no runtime status fields).
+    let linear = LinearTarget::new(mock_a.clone(), 64);
+    let expected_table = format!("{}:{} 64", id_a.major().get(), id_a.minor().get());
+    assert_eq!(
+        linear.status_params(TargetStatusMode::Table),
+        expected_table
+    );
+    assert_eq!(linear.status_params(TargetStatusMode::Status), "");
+
+    // Zero and error targets report nothing in either mode.
+    let zero = ZeroTarget::new(128);
+    assert_eq!(zero.status_params(TargetStatusMode::Table), "");
+    assert_eq!(zero.status_params(TargetStatusMode::Status), "");
+    let error = ErrorTarget::new(128);
+    assert_eq!(error.status_params(TargetStatusMode::Table), "");
+    assert_eq!(error.status_params(TargetStatusMode::Status), "");
+
+    // The table-level view propagates the mode to every target.
+    let mut table = DmTable::new();
+    table
+        .add_target(
+            0,
+            128,
+            DmTarget::Linear(LinearTarget::new(mock_a.clone(), 0)),
+        )
+        .unwrap();
+    table
+        .add_target(
+            128,
+            128,
+            DmTarget::Striped(StripedTarget::new(vec![(mock_b.clone(), 0)], 8)),
+        )
+        .unwrap();
+    let infos = table.target_infos(TargetStatusMode::Status);
+    assert_eq!(infos.len(), 2);
+    assert_eq!(infos[0].params, "");
+    let expected = format!("1 {}:{} 1 A", id_b.major().get(), id_b.minor().get());
+    assert_eq!(infos[1].params, expected);
+
+    let infos = table.target_infos(TargetStatusMode::Table);
+    let expected_linear = format!("{}:{} 0", id_a.major().get(), id_a.minor().get());
+    assert_eq!(infos[0].params, expected_linear);
+    let expected_striped = format!("1 8 {}:{} 0", id_b.major().get(), id_b.minor().get());
+    assert_eq!(infos[1].params, expected_striped);
 }

@@ -8,7 +8,7 @@
 //! contiguous logical range to a contiguous physical range on a single
 //! underlying device.
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
 use aster_block::{
     BlockDevice, BlockDeviceMeta,
@@ -23,6 +23,20 @@ use crate::{
         zero::ZeroTarget,
     },
 };
+
+/// Selects which form of status text [`Target::status_params`] returns.
+///
+/// `dmsetup table` sets `DM_STATUS_TABLE_FLAG` and maps to
+/// [`Table`](TargetStatusMode::Table); `dmsetup status` leaves the flag unset
+/// and maps to [`Status`](TargetStatusMode::Status). This mirrors Linux's
+/// `STATUSTYPE_TABLE` / `STATUSTYPE_INFO` split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetStatusMode {
+    /// The parameters exactly as the table was loaded.
+    Table,
+    /// Runtime status fields (target-type specific, may be empty).
+    Status,
+}
 
 /// A device mapper target.
 ///
@@ -54,12 +68,15 @@ pub trait Target: Send + Sync + core::fmt::Debug {
     /// consulted to compute the mapped device's overall segment limit.
     fn metadata(&self) -> BlockDeviceMeta;
 
-    /// Returns the parameters string for this target, used in `DM_TABLE_STATUS`
-    /// and for diagnostics.
+    /// Returns the parameters or runtime status string for this target, used
+    /// in `DM_TABLE_STATUS` output.
     ///
-    /// The format is target-type specific. For example, a linear target
-    /// returns `"major:minor start_sector"`.
-    fn params(&self) -> &str;
+    /// In [`Table`](TargetStatusMode::Table) mode the format matches the
+    /// parameters the table was loaded with (e.g., a linear target returns
+    /// `"major:minor start_sector"`). In [`Status`](TargetStatusMode::Status)
+    /// mode the format is the Linux runtime status layout, which is empty for
+    /// most target types.
+    fn status_params(&self, mode: TargetStatusMode) -> String;
 
     /// Returns the list of underlying block device IDs that this target
     /// depends on, used for `DM_TABLE_DEPS`.
@@ -165,13 +182,13 @@ impl Target for DmTarget {
         }
     }
 
-    fn params(&self) -> &str {
+    fn status_params(&self, mode: TargetStatusMode) -> String {
         match self {
-            DmTarget::Linear(t) => t.params(),
-            DmTarget::Striped(t) => t.params(),
-            DmTarget::Verity(t) => t.params(),
-            DmTarget::Zero(t) => t.params(),
-            DmTarget::Error(t) => t.params(),
+            DmTarget::Linear(t) => t.status_params(mode),
+            DmTarget::Striped(t) => t.status_params(mode),
+            DmTarget::Verity(t) => t.status_params(mode),
+            DmTarget::Zero(t) => t.status_params(mode),
+            DmTarget::Error(t) => t.status_params(mode),
         }
     }
 
