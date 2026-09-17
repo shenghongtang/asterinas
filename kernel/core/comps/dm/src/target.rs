@@ -19,8 +19,8 @@ use device_id::DeviceId;
 use crate::{
     DmError,
     targets::{
-        error::ErrorTarget, linear::LinearTarget, striped::StripedTarget, verity::VerityTarget,
-        zero::ZeroTarget,
+        error::ErrorTarget, flakey::FlakeyTarget, linear::LinearTarget, striped::StripedTarget,
+        verity::VerityTarget, zero::ZeroTarget,
     },
 };
 
@@ -149,6 +149,8 @@ pub enum DmTarget {
     Zero(ZeroTarget),
     /// A target that always returns I/O errors.
     Error(ErrorTarget),
+    /// A target that injects periodic I/O failures.
+    Flakey(FlakeyTarget),
 }
 
 impl Target for DmTarget {
@@ -159,6 +161,7 @@ impl Target for DmTarget {
             DmTarget::Verity(t) => t.name(),
             DmTarget::Zero(t) => t.name(),
             DmTarget::Error(t) => t.name(),
+            DmTarget::Flakey(t) => t.name(),
         }
     }
 
@@ -169,6 +172,7 @@ impl Target for DmTarget {
             DmTarget::Verity(t) => t.map_bio(bio, logical_start),
             DmTarget::Zero(t) => t.map_bio(bio, logical_start),
             DmTarget::Error(t) => t.map_bio(bio, logical_start),
+            DmTarget::Flakey(t) => t.map_bio(bio, logical_start),
         }
     }
 
@@ -179,6 +183,7 @@ impl Target for DmTarget {
             DmTarget::Verity(t) => t.metadata(),
             DmTarget::Zero(t) => t.metadata(),
             DmTarget::Error(t) => t.metadata(),
+            DmTarget::Flakey(t) => t.metadata(),
         }
     }
 
@@ -189,6 +194,7 @@ impl Target for DmTarget {
             DmTarget::Verity(t) => t.status_params(mode),
             DmTarget::Zero(t) => t.status_params(mode),
             DmTarget::Error(t) => t.status_params(mode),
+            DmTarget::Flakey(t) => t.status_params(mode),
         }
     }
 
@@ -199,6 +205,7 @@ impl Target for DmTarget {
             DmTarget::Verity(t) => t.deps(),
             DmTarget::Zero(t) => t.deps(),
             DmTarget::Error(t) => t.deps(),
+            DmTarget::Flakey(t) => t.deps(),
         }
     }
 
@@ -209,6 +216,7 @@ impl Target for DmTarget {
             DmTarget::Verity(t) => t.underlying_devices(),
             DmTarget::Zero(t) => t.underlying_devices(),
             DmTarget::Error(t) => t.underlying_devices(),
+            DmTarget::Flakey(t) => t.underlying_devices(),
         }
     }
 
@@ -219,6 +227,7 @@ impl Target for DmTarget {
             DmTarget::Verity(t) => t.message(sector, message),
             DmTarget::Zero(t) => t.message(sector, message),
             DmTarget::Error(t) => t.message(sector, message),
+            DmTarget::Flakey(t) => t.message(sector, message),
         }
     }
 }

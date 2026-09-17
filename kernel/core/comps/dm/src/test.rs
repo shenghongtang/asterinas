@@ -28,8 +28,8 @@ use ostd::{
 use crate::{
     DmError, DmTable, DmTarget, MappedDevice, TableError, Target, TargetStatusMode,
     targets::{
-        error::ErrorTarget, linear::LinearTarget, striped::StripedTarget, verity::VerityTarget,
-        zero::ZeroTarget,
+        error::ErrorTarget, flakey::FlakeyTarget, linear::LinearTarget, striped::StripedTarget,
+        verity::VerityTarget, zero::ZeroTarget,
     },
 };
 
@@ -1595,6 +1595,297 @@ fn error_write_fails() {
         BioStatus::IoError,
         "error target should fail writes with IoError"
     );
+}
+
+// ===========================================================================
+// Flakey target tests
+//
+// The flakey target alternates between "up" (pass-through) and "down"
+// (failure-injecting) intervals. The phase is time-based, so the tests use
+// deterministic interval parameters: a huge up interval keeps the target
+// always up, while `up = 0` keeps it always down.
+// ===========================================================================
+
+/// Submits a one-block bio of `bio_type` and returns its completion status.
+fn submit_one_block(device: &dyn BlockDevice, bio_type: BioType, bid: Bid) -> BioStatus {
+    let direction = match bio_type {
+        BioType::Write => BioDirection::ToDevice,
+        _ => BioDirection::FromDevice,
+    };
+    let segment = BioSegment::alloc(1, direction);
+    let bio = Bio::new(bio_type, Sid::from(bid), vec![segment], None);
+    bio.submit_and_wait(device).unwrap()
+}
+
+/// Test: an always-up flakey target passes reads and writes through.
+#[ktest]
+fn flakey_always_up_passes_io() {
+    ensure_initialized();
+
+    let mock = MockBlockDevice::new("mock-flakey-up", 256);
+    let mut table = DmTable::new();
+    // Up for ~31 years, down for 1 second: always up during the test.
+    table
+        .add_target(
+            0,
+            256,
+            DmTarget::Flakey(FlakeyTarget::new(
+                mock.clone(),
+                0,
+                1_000_000_000,
+                1,
+                false,
+                false,
+            )),
+        )
+        .unwrap();
+    let mapped = MappedDevice::create("dm-flakey-0", table).unwrap();
+
+    let pattern: Vec<u8> = (0..BLOCK_SIZE).map(|i| (i % 239) as u8).collect();
+    write_blocks(mapped.as_ref(), Bid::new(0), &pattern);
+    assert_eq!(
+        read_blocks(mapped.as_ref(), Bid::new(0), BLOCK_SIZE),
+        pattern
+    );
+    assert_eq!(mock.read_bytes(0, BLOCK_SIZE), pattern);
+}
+
+/// Test: an always-down flakey target without features fails every bio.
+#[ktest]
+fn flakey_always_down_fails_all() {
+    ensure_initialized();
+
+    let mock = MockBlockDevice::new("mock-flakey-down", 256);
+    let mut table = DmTable::new();
+    // up = 0: always down.
+    table
+        .add_target(
+            0,
+            256,
+            DmTarget::Flakey(FlakeyTarget::new(mock.clone(), 0, 0, 1, false, false)),
+        )
+        .unwrap();
+    let mapped = MappedDevice::create("dm-flakey-1", table).unwrap();
+
+    assert_eq!(
+        submit_one_block(mapped.as_ref(), BioType::Read, Bid::new(0)),
+        BioStatus::IoError,
+        "reads must fail while down without features"
+    );
+    assert_eq!(
+        submit_one_block(mapped.as_ref(), BioType::Write, Bid::new(0)),
+        BioStatus::IoError,
+        "writes must fail while down without features"
+    );
+}
+
+/// Test: with `drop_writes`, down-interval writes report success without
+/// reaching the device while reads are still serviced.
+#[ktest]
+fn flakey_drop_writes() {
+    ensure_initialized();
+
+    let mock = MockBlockDevice::new("mock-flakey-drop", 256);
+    let pattern: Vec<u8> = (0..BLOCK_SIZE).map(|i| (i % 241) as u8).collect();
+    // Pre-populate the backing device so the read pass-through has data.
+    write_blocks(mock.as_ref(), Bid::new(0), &pattern);
+
+    let mut table = DmTable::new();
+    table
+        .add_target(
+            0,
+            256,
+            DmTarget::Flakey(FlakeyTarget::new(mock.clone(), 0, 0, 1, true, false)),
+        )
+        .unwrap();
+    let mapped = MappedDevice::create("dm-flakey-2", table).unwrap();
+
+    // Writes are silently dropped: they complete successfully...
+    assert_eq!(
+        submit_one_block(mapped.as_ref(), BioType::Write, Bid::new(0)),
+        BioStatus::Complete,
+        "drop_writes must report success for writes"
+    );
+    // ...but never reach the underlying device.
+    assert_eq!(
+        mock.read_bytes(0, BLOCK_SIZE),
+        pattern,
+        "dropped writes must not modify the backing device"
+    );
+    // Reads are serviced normally.
+    assert_eq!(
+        read_blocks(mapped.as_ref(), Bid::new(0), BLOCK_SIZE),
+        pattern
+    );
+}
+
+/// Test: with `error_writes`, down-interval writes fail while reads are
+/// still serviced.
+#[ktest]
+fn flakey_error_writes() {
+    ensure_initialized();
+
+    let mock = MockBlockDevice::new("mock-flakey-err", 256);
+    let pattern: Vec<u8> = (0..BLOCK_SIZE).map(|i| (i % 233) as u8).collect();
+    write_blocks(mock.as_ref(), Bid::new(0), &pattern);
+
+    let mut table = DmTable::new();
+    table
+        .add_target(
+            0,
+            256,
+            DmTarget::Flakey(FlakeyTarget::new(mock.clone(), 0, 0, 1, false, true)),
+        )
+        .unwrap();
+    let mapped = MappedDevice::create("dm-flakey-3", table).unwrap();
+
+    assert_eq!(
+        submit_one_block(mapped.as_ref(), BioType::Write, Bid::new(0)),
+        BioStatus::IoError,
+        "error_writes must fail writes"
+    );
+    assert_eq!(
+        read_blocks(mapped.as_ref(), Bid::new(0), BLOCK_SIZE),
+        pattern
+    );
+}
+
+/// Test: the table status replays the parameters and the runtime status
+/// reports the current phase (`up`/`down`).
+#[ktest]
+fn flakey_status_params() {
+    ensure_initialized();
+
+    let mock = MockBlockDevice::new("mock-flakey-status", 256);
+    let dev_str = format!("{}:{}", mock.id().major().get(), mock.id().minor().get());
+
+    let up_target = FlakeyTarget::new(mock.clone(), 8, 1_000_000_000, 1, false, false);
+    assert_eq!(
+        up_target.status_params(TargetStatusMode::Table),
+        format!("{} 8 1000000000 1 0", dev_str)
+    );
+    assert_eq!(up_target.status_params(TargetStatusMode::Status), "up");
+
+    let down_target = FlakeyTarget::new(mock.clone(), 0, 0, 1, true, false);
+    assert_eq!(
+        down_target.status_params(TargetStatusMode::Table),
+        format!("{} 0 0 1 1 drop_writes", dev_str)
+    );
+    assert_eq!(down_target.status_params(TargetStatusMode::Status), "down");
+
+    let err_target = FlakeyTarget::new(mock.clone(), 0, 0, 1, false, true);
+    assert_eq!(
+        err_target.status_params(TargetStatusMode::Table),
+        format!("{} 0 0 1 1 error_writes", dev_str)
+    );
+}
+
+/// Test: the textual table parser accepts valid flakey specs (with and
+/// without optional features) and replays the feature suffix in the table
+/// status.
+#[ktest]
+fn flakey_parses_table_params() {
+    ensure_initialized();
+    let mock = MockBlockDevice::new("mock-flakey-parse", 256);
+    register_mock(&mock);
+
+    let target = crate::parse_target("flakey", &["mock-flakey-parse", "0", "10", "5"], 256)
+        .expect("a feature-less flakey spec must parse");
+    assert!(matches!(target, DmTarget::Flakey(_)));
+    for args in [
+        &["mock-flakey-parse", "0", "10", "5", "0"][..],
+        &["mock-flakey-parse", "0", "10", "5", "1", "drop_writes"][..],
+        &["mock-flakey-parse", "0", "10", "5", "1", "error_writes"][..],
+    ] {
+        assert!(
+            crate::parse_target("flakey", args, 256).is_ok(),
+            "valid flakey spec must parse: {:?}",
+            args
+        );
+    }
+
+    let target = crate::parse_target(
+        "flakey",
+        &["mock-flakey-parse", "0", "10", "5", "1", "drop_writes"],
+        256,
+    )
+    .unwrap();
+    assert!(
+        target
+            .status_params(TargetStatusMode::Table)
+            .ends_with("1 drop_writes"),
+        "the table status must replay the drop_writes feature"
+    );
+}
+
+/// Test: the parser rejects malformed flakey specs with the classified
+/// error of the matching category.
+#[ktest]
+fn flakey_parser_classifies_errors() {
+    ensure_initialized();
+    let mock = MockBlockDevice::new("mock-flakey-cls", 256);
+    register_mock(&mock);
+
+    let cases: &[(&[&str], u64, ErrClass)] = &[
+        // Too few arguments.
+        (&["mock-flakey-cls", "0", "10"], 256, ErrClass::Table),
+        // Non-numeric start sector / intervals.
+        (&["mock-flakey-cls", "x", "10", "5"], 256, ErrClass::Table),
+        (&["mock-flakey-cls", "0", "x", "5"], 256, ErrClass::Table),
+        (&["mock-flakey-cls", "0", "10", "x"], 256, ErrClass::Table),
+        // Both intervals are zero.
+        (&["mock-flakey-cls", "0", "0", "0"], 256, ErrClass::Table),
+        // Non-numeric feature count.
+        (
+            &["mock-flakey-cls", "0", "10", "5", "x"],
+            256,
+            ErrClass::Table,
+        ),
+        // Feature count without the feature token (and vice versa).
+        (
+            &["mock-flakey-cls", "0", "10", "5", "1"],
+            256,
+            ErrClass::Table,
+        ),
+        (
+            &["mock-flakey-cls", "0", "10", "5", "0", "drop_writes"],
+            256,
+            ErrClass::Table,
+        ),
+        // Unknown feature.
+        (
+            &["mock-flakey-cls", "0", "10", "5", "1", "corrupt"],
+            256,
+            ErrClass::Table,
+        ),
+        // More features than supported.
+        (
+            &[
+                "mock-flakey-cls",
+                "0",
+                "10",
+                "5",
+                "2",
+                "drop_writes",
+                "error_writes",
+            ],
+            256,
+            ErrClass::Table,
+        ),
+        // The mapping extends past the end of the backing device.
+        (&["mock-flakey-cls", "256", "10", "5"], 1, ErrClass::Table),
+        // Unknown backing device.
+        (
+            &["no-such-dev", "0", "10", "5"],
+            256,
+            ErrClass::ResolveBacking,
+        ),
+    ];
+    for (index, (args, len_sectors, want)) in cases.iter().enumerate() {
+        let err = crate::parse_target("flakey", args, *len_sectors)
+            .expect_err("every matrix case must fail to parse");
+        assert_eq!(err_class(&err), *want, "matrix case {}", index);
+    }
 }
 
 // ===========================================================================

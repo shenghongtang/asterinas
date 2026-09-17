@@ -3,6 +3,7 @@
 //! Built-in device mapper target implementations.
 
 pub mod error;
+pub mod flakey;
 pub mod linear;
 pub mod striped;
 pub mod verity;
@@ -19,6 +20,7 @@ use crate::target::DmTargetMetadata;
 /// registration or init-order handling is needed.
 pub const SUPPORTED_TARGETS: &[DmTargetMetadata] = &[
     error::METADATA,
+    flakey::METADATA,
     linear::METADATA,
     striped::METADATA,
     verity::METADATA,

@@ -47,8 +47,8 @@ use aster_cmdline::parse::ParamError;
 use crate::{
     DmError, DmTable, DmTarget, MappedDevice,
     targets::{
-        error::ErrorTarget, linear::LinearTarget, striped::StripedTarget, verity::VerityTarget,
-        zero::ZeroTarget,
+        error::ErrorTarget, flakey::FlakeyTarget, linear::LinearTarget, striped::StripedTarget,
+        verity::VerityTarget, zero::ZeroTarget,
     },
 };
 
@@ -152,7 +152,8 @@ fn split_name_and_table(arg: &str) -> Option<(&str, &str)> {
 /// that validation rules (stripe size being a power of two, mappings staying
 /// within the underlying device, etc.) cannot drift between them.
 ///
-/// Supported target types: `linear`, `striped`, `zero`, `error`, `verity`.
+/// Supported target types: `linear`, `striped`, `zero`, `error`, `flakey`,
+/// `verity`.
 pub fn parse_target(
     target_type: &str,
     args: &[&str],
@@ -173,6 +174,7 @@ pub fn parse_target(
             }
             DmTarget::Error(ErrorTarget::new(len_sectors))
         }
+        "flakey" => DmTarget::Flakey(parse_flakey_target(args, len_sectors)?),
         "verity" => DmTarget::Verity(Arc::new(parse_verity_target(args)?)),
         _ => return Err(DmError::UnsupportedTarget),
     };
@@ -280,6 +282,67 @@ fn parse_striped_target(args: &[&str], len_sectors: u64) -> Result<StripedTarget
     }
 
     Ok(StripedTarget::new(stripes, stripe_size))
+}
+
+fn parse_flakey_target(args: &[&str], len_sectors: u64) -> Result<FlakeyTarget, DmError> {
+    // Format: "<dev> <start> <up_interval> <down_interval>
+    //          [<num_features> [<feature> ...]]"
+    // Intervals are in seconds. Supported features: drop_writes,
+    // error_writes (mutually exclusive).
+    if args.len() < 4 {
+        return Err(DmError::Table("flakey: wrong argument count"));
+    }
+    let device = crate::lookup_block_device(args[0])
+        .map_err(|_| DmError::ResolveBacking("flakey: cannot resolve backing device"))?;
+    let start_sector = args[1]
+        .parse::<u64>()
+        .map_err(|_| DmError::Table("flakey: invalid start sector"))?;
+    let up_interval = args[2]
+        .parse::<u64>()
+        .map_err(|_| DmError::Table("flakey: invalid up interval"))?;
+    let down_interval = args[3]
+        .parse::<u64>()
+        .map_err(|_| DmError::Table("flakey: invalid down interval"))?;
+    if up_interval.checked_add(down_interval).is_none() || up_interval + down_interval == 0 {
+        return Err(DmError::Table(
+            "flakey: up and down intervals must not both be zero",
+        ));
+    }
+
+    let (drop_writes, error_writes) = match args.len() {
+        4 => (false, false),
+        _ => {
+            let num_features: usize = args[4]
+                .parse()
+                .map_err(|_| DmError::Table("flakey: invalid feature count"))?;
+            if num_features == 0 && args.len() == 5 {
+                (false, false)
+            } else if num_features == 1 && args.len() == 6 {
+                match args[5] {
+                    "drop_writes" => (true, false),
+                    "error_writes" => (false, true),
+                    _ => return Err(DmError::Table("flakey: unknown feature")),
+                }
+            } else {
+                return Err(DmError::Table("flakey: invalid feature arguments"));
+            }
+        }
+    };
+
+    let end_sector = start_sector
+        .checked_add(len_sectors)
+        .ok_or(DmError::Table("flakey: mapping overflows sector space"))?;
+    if end_sector > device.metadata().nr_sectors as u64 {
+        return Err(DmError::Table("flakey: offset beyond device"));
+    }
+    Ok(FlakeyTarget::new(
+        device,
+        start_sector,
+        up_interval,
+        down_interval,
+        drop_writes,
+        error_writes,
+    ))
 }
 
 fn parse_verity_target(args: &[&str]) -> Result<VerityTarget, DmError> {
