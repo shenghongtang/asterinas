@@ -100,9 +100,9 @@ version = "0.1.0"
 dependencies = [
  "align_ext",
  "aster-util",
- "bitvec",
  "component",
  "device-id",
+ "dma-pool",
  "id-alloc",
  "int-to-c-enum",
  "io-util",
@@ -212,6 +212,21 @@ dependencies = [
  "ostd",
  "smallvec",
  "spin",
+]
+
+[[package]]
+name = "aster-drm"
+version = "0.1.0"
+dependencies = [
+ "aster-core",
+ "atomic-integer-wrapper",
+ "bitflags 1.3.2",
+ "device-id",
+ "int-to-c-enum",
+ "ostd",
+ "ostd-pod",
+ "sparse-id-alloc",
+ "zerocopy",
 ]
 
 [[package]]
@@ -353,6 +368,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-simpledrm"
+version = "0.1.0"
+dependencies = [
+ "aster-core",
+ "aster-drm",
+ "aster-framebuffer",
+ "component",
+ "ostd",
+]
+
+[[package]]
 name = "aster-softirq"
 version = "0.1.0"
 dependencies = [
@@ -370,6 +396,7 @@ dependencies = [
  "aster-util",
  "bitflags 2.13.0",
  "component",
+ "id-alloc",
  "inherit-methods-macro",
  "ostd",
  "spin",
@@ -407,6 +434,7 @@ version = "0.1.0"
 dependencies = [
  "aster-rights",
  "aster-rights-proc",
+ "bitvec",
  "inherit-methods-macro",
  "osdk-heap-allocator",
  "ostd",
@@ -452,6 +480,8 @@ name = "asterinas"
 version = "0.1.0"
 dependencies = [
  "aster-core",
+ "aster-drm",
+ "aster-simpledrm",
  "aster-uart",
  "ostd",
 ]

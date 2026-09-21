@@ -97,7 +97,7 @@ impl BlockDevice for MockBlockDevice {
                 let mut byte_offset = start_byte;
                 for segment in bio.segments() {
                     let nbytes = segment.nbytes();
-                    let slice = segment.inner_dma_slice();
+                    let slice = segment.dma_slice();
                     let mut reader =
                         VmReader::from(&data[byte_offset..byte_offset + nbytes]).to_fallible();
                     // Write device data into the bio segment's DMA buffer.
@@ -111,7 +111,7 @@ impl BlockDevice for MockBlockDevice {
                 let mut byte_offset = start_byte;
                 for segment in bio.segments() {
                     let nbytes = segment.nbytes();
-                    let slice = segment.inner_dma_slice();
+                    let slice = segment.dma_slice();
                     let mut writer =
                         VmWriter::from(&mut data[byte_offset..byte_offset + nbytes]).to_fallible();
                     // Read data from the bio segment's DMA buffer into device storage.

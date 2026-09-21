@@ -130,9 +130,9 @@ pub enum Error {
     NotFound,
     /// Invalid arguments
     InvalidArgs,
-    /// Id Acquired
+    /// ID acquired
     IdAcquired,
-    /// Id Exhausted
+    /// ID exhausted
     IdExhausted,
     /// The device is still in use (lease held) or is transitioning state.
     Busy,

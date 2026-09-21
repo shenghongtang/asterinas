@@ -599,7 +599,12 @@ impl VerityReadCtx {
 
         if inner.level_rev_idx == PHASE_DATA {
             // A data-block read just completed.
-            if inner.data_seg.inner_dma_slice().sync_from_device().is_err() {
+            let data_slice = inner.data_seg.dma_slice();
+            if data_slice
+                .mem_obj()
+                .sync_from_device(data_slice.offset().clone())
+                .is_err()
+            {
                 return NextAction::Fail;
             }
             if inner.data_seg.read_bytes(0, &mut inner.data_block).is_err() {
@@ -617,7 +622,12 @@ impl VerityReadCtx {
         let Some(level) = target.levels.iter().rev().nth(inner.level_rev_idx) else {
             return NextAction::Fail;
         };
-        if inner.hash_seg.inner_dma_slice().sync_from_device().is_err() {
+        let hash_slice = inner.hash_seg.dma_slice();
+        if hash_slice
+            .mem_obj()
+            .sync_from_device(hash_slice.offset().clone())
+            .is_err()
+        {
             return NextAction::Fail;
         }
         if inner
@@ -682,7 +692,7 @@ impl VerityReadCtx {
             let within_block = (inner.device_offset as usize) % target.data_block_size;
             let chunk = (target.data_block_size - within_block).min(nbytes - inner.seg_offset);
             if segment
-                .inner_dma_slice()
+                .dma_slice()
                 .write_bytes(
                     inner.seg_offset,
                     &inner.data_block[within_block..within_block + chunk],
@@ -746,7 +756,7 @@ impl VerityReadCtx {
         let mut io_batch = IoBatch::new();
         ctx.target
             .data_device
-            .read_blocks_async(bid, seg, Some(complete_fn), &mut io_batch)
+            .read_blocks_async(bid, vec![seg], Some(complete_fn), &mut io_batch)
     }
 
     /// Submits an asynchronous read for the current hash-tree node.
@@ -781,7 +791,7 @@ impl VerityReadCtx {
         let mut io_batch = IoBatch::new();
         ctx.target
             .hash_device
-            .read_blocks_async(bid, seg, Some(complete_fn), &mut io_batch)
+            .read_blocks_async(bid, vec![seg], Some(complete_fn), &mut io_batch)
     }
 
     /// Completes the bio with the given status, removing it from the state.
