@@ -50,8 +50,8 @@ pub mod request_queue;
 use ::device_id::DeviceId;
 use component::{ComponentInitError, init_component};
 pub use device_id::{
-    MajorIdOwner, acquire_major, acquire_major_with_name, allocate_major,
-    allocate_major_with_name, major_devices,
+    MajorIdOwner, acquire_major, acquire_major_with_name, allocate_major, allocate_major_with_name,
+    major_devices,
 };
 use ostd::sync::Mutex;
 pub use partition::PartitionManager;

@@ -694,7 +694,10 @@ impl BioSegment {
             .unwrap_or_else(|| {
                 let dma_stream = DmaStream::alloc_uninit(nblocks, false).unwrap();
                 BioSegmentInner {
-                    storage: Slice::new(Arc::new(DmaBuffer::Direct(dma_stream)), offset..offset + len),
+                    storage: Slice::new(
+                        Arc::new(DmaBuffer::Direct(dma_stream)),
+                        offset..offset + len,
+                    ),
                     direction,
                 }
             });
