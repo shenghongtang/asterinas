@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use device_id::DeviceId;
+
 use super::{JobControl, Pgid, Process, Session, session::SessionGuard};
 use crate::{
     device::Device, dispatch_ioctl, prelude::*, process::pid_table, util::ioctl::RawIoctl,
@@ -32,6 +34,12 @@ mod ioctl_defs {
 }
 
 impl dyn Terminal {
+    /// Returns the device ID of the terminal.
+    pub(crate) fn id(&self) -> DeviceId {
+        let (major_owner, minor) = self.owned_id();
+        DeviceId::new(major_owner.get(), minor)
+    }
+
     /// Handles job-control ioctls.
     ///
     /// The return value depends on whether the ioctl is recognized:

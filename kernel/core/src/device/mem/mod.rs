@@ -20,14 +20,14 @@
 
 mod file;
 
-use device_id::{DeviceId, MajorId, MinorId};
+use device_id::{MajorId, MajorIdOwner, MinorId};
 use file::MemFile;
 pub(crate) use file::{getrandom, geturandom};
 use spin::Once;
 
 use super::{
     Device, DeviceType,
-    registry::char::{MajorIdOwner, acquire_major, register},
+    registry::char::{acquire_major, register},
 };
 use crate::{
     fs::{
@@ -40,19 +40,12 @@ use crate::{
 /// A memory device.
 #[derive(Debug)]
 pub(crate) struct MemDevice {
-    id: DeviceId,
     file: MemFile,
 }
 
 impl MemDevice {
     fn new(file: MemFile) -> Self {
-        let major = MEM_MAJOR.get().unwrap().get();
-        let minor = MinorId::new(file.minor());
-
-        Self {
-            id: DeviceId::new(major, minor),
-            file,
-        }
+        Self { file }
     }
 }
 
@@ -61,8 +54,8 @@ impl Device for MemDevice {
         DeviceType::Char
     }
 
-    fn id(&self) -> DeviceId {
-        self.id
+    fn owned_id(&self) -> (&MajorIdOwner, MinorId) {
+        (MEM_MAJOR.get().unwrap(), MinorId::new(self.file.minor()))
     }
 
     fn devtmpfs_meta(&self) -> Option<DevtmpfsNodeMeta> {
@@ -92,7 +85,7 @@ impl Device for MemDevice {
 static MEM_MAJOR: Once<MajorIdOwner> = Once::new();
 
 pub(super) fn init_in_first_kthread() {
-    MEM_MAJOR.call_once(|| acquire_major(MajorId::new(1)).unwrap());
+    MEM_MAJOR.call_once(|| acquire_major(MajorId::new(1), "mem").unwrap());
 
     register(Arc::new(MemDevice::new(MemFile::Full))).unwrap();
     register(Arc::new(MemDevice::new(MemFile::Null))).unwrap();

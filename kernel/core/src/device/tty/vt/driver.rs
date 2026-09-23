@@ -6,6 +6,7 @@ use aster_framebuffer::{
     font::BitmapFont,
     mode::{ConsoleMode, KeyboardMode},
 };
+use device_id::MajorIdOwner;
 use ostd::mm::VmIo;
 
 use crate::{
@@ -15,6 +16,7 @@ use crate::{
         tty::{
             CFontOp, Tty, TtyDriver,
             termio::CTermios,
+            tty_major_id_owner,
             vt::{
                 VtIndex,
                 c_types::{CVtMode, ReleaseDisplayType},
@@ -92,8 +94,9 @@ impl VtDriver {
 }
 
 impl TtyDriver for VtDriver {
-    // Reference: <https://elixir.bootlin.com/linux/v6.17/source/include/uapi/linux/major.h#L18>.
-    const DEVICE_MAJOR_ID: u32 = 4;
+    fn major_id_owner() -> &'static MajorIdOwner {
+        tty_major_id_owner()
+    }
 
     fn devtmpfs_meta(&self, index: u32) -> Option<DevtmpfsNodeMeta> {
         Some(DevtmpfsNodeMeta::new(format!("tty{}", index)).unwrap())
@@ -267,9 +270,10 @@ impl TtyDriver for VtDriver {
 fn check_vt_ioctl_perm(tty: &Tty<VtDriver>) -> Result<()> {
     // Reference: <https://elixir.bootlin.com/linux/v6.17/source/drivers/tty/vt/vt_ioctl.c#L743-L749>
 
+    let tty_id = (tty as &dyn Device).id();
     if current!()
         .terminal()
-        .is_some_and(|terminal| terminal.id() == tty.id())
+        .is_some_and(|terminal| terminal.id() == tty_id)
     {
         return Ok(());
     }

@@ -125,3 +125,40 @@ pub type MajorId = RangedU16<0, MAX_MAJOR_ID>;
 ///
 /// Reference: <https://elixir.bootlin.com/linux/v6.13/source/include/linux/kdev_t.h#L11>.
 pub type MinorId = RangedU32<0, MAX_MINOR_ID>;
+
+/// An owned major ID.
+///
+/// Each instance of this type will unregister the major ID when dropped.
+/// The `release` function is called to perform the actual unregistration
+/// from the appropriate device registry (char or block).
+#[derive(Debug)]
+pub struct MajorIdOwner {
+    major: MajorId,
+    release: fn(u16),
+}
+
+impl MajorIdOwner {
+    /// Creates a `MajorIdOwner` with the given release function.
+    ///
+    /// The release function is called when the owner is dropped, to remove
+    /// the major ID from its device registry.
+    ///
+    /// Note that this is a low-level constructor intended for device registries
+    /// (i.e., the char and block device registries). Other users should acquire
+    /// a major ID through the registry, so that the major ID is properly tracked
+    /// by the registry and released back to it on drop.
+    pub fn new(major: MajorId, release: fn(u16)) -> Self {
+        Self { major, release }
+    }
+
+    /// Returns the major ID.
+    pub fn get(&self) -> MajorId {
+        self.major
+    }
+}
+
+impl Drop for MajorIdOwner {
+    fn drop(&mut self) {
+        (self.release)(self.major.get());
+    }
+}

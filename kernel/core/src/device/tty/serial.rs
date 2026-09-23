@@ -3,10 +3,11 @@
 use alloc::format;
 
 use aster_console::AnyConsoleDevice;
+use device_id::MajorIdOwner;
 use ostd::mm::Infallible;
 use spin::Once;
 
-use super::{Tty, TtyDriver};
+use super::{Tty, TtyDriver, tty_major_id_owner};
 use crate::{
     device::{
         registry::char,
@@ -27,8 +28,9 @@ impl SerialDriver {
 }
 
 impl TtyDriver for SerialDriver {
-    // Reference: <https://elixir.bootlin.com/linux/v6.17/source/include/uapi/linux/major.h#L18>.
-    const DEVICE_MAJOR_ID: u32 = 4;
+    fn major_id_owner() -> &'static MajorIdOwner {
+        tty_major_id_owner()
+    }
 
     fn devtmpfs_meta(&self, index: u32) -> Option<DevtmpfsNodeMeta> {
         Some(DevtmpfsNodeMeta::new(format!("ttyS{}", index - Self::MINOR_ID_BASE)).unwrap())

@@ -210,6 +210,7 @@ dependencies = [
  "ostd",
  "ostd-pod",
  "sparse-id-alloc",
+ "spin",
  "zerocopy",
 ]
 
@@ -290,6 +291,7 @@ dependencies = [
  "ostd-pod",
  "postcard",
  "serde",
+ "spin",
  "zerocopy",
 ]
 
