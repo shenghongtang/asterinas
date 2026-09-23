@@ -49,16 +49,18 @@ pub mod request_queue;
 
 use ::device_id::DeviceId;
 use component::{ComponentInitError, init_component};
-pub use device_id::{
-    MajorIdOwner, acquire_major, acquire_major_with_name, allocate_major, allocate_major_with_name,
-    major_devices,
-};
 use ostd::sync::Mutex;
-pub use partition::PartitionManager;
 
 use self::{
     bio::{BioEnqueueError, SubmittedBio},
     prelude::*,
+};
+pub use self::{
+    device_id::{
+        MAX_MAJOR, MajorIdOwner, acquire_major, acquire_major_with_name, allocate_major,
+        allocate_major_with_name, major_devices,
+    },
+    partition::PartitionManager,
 };
 
 pub const BLOCK_SIZE: usize = ostd::mm::PAGE_SIZE;
